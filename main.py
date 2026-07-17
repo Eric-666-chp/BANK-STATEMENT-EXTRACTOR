@@ -12,18 +12,24 @@ from openpyxl.styles import Alignment, Border, Side, Font
 # ================= 公共判定/清洗 =================
 
 DATE_MMDDSHORT = re.compile(
-    r'^\s*(?:0[1-9]|1[0-2])/(?:0[1-9]|[12]\d|3[01])\s*$'
+    r'^\s*(?:1[0-2]|0[1-9])/(?:3[01]|[12]\d|0[1-9])\s*$'
 )
 
 DATE_MMDDYY = re.compile(
-    r'^\s*(?:0[1-9]|1[0-2])/(?:0[1-9]|[12]\d|3[01])/\d{2}\s*$'
+    r'^\s*(?:1[0-2]|0[1-9])/(?:3[01]|[12]\d|0[1-9])/\d{2}\s*$'
 )
 
 DATE_MMDDYYYY = re.compile(
-    r'^\s*(?:0[1-9]|1[0-2])/(?:0[1-9]|[12]\d|3[01])/\d{4}\s*$'
+    r'^\s*(?:1[0-2]|0[1-9])/(?:3[01]|[12]\d|0[1-9])/\d{4}\s*$'
 )
 
-DATE_ANY_IN_TEXT_PATTERN = r'(?:0[1-9]|1[0-2])/(?:0[1-9]|[12]\d|3[01])(?:/(?:\d{2}|\d{4}))?'
+DEFAULT_DATE_ANY_IN_TEXT_PATTERN = (
+    r'(?:1[0-2]|0[1-9])/'
+    r'(?:3[01]|[12]\d|0[1-9])'
+    r'(?:/(?:\d{2}|\d{4}))?'
+)
+
+DATE_ANY_IN_TEXT_PATTERN = DEFAULT_DATE_ANY_IN_TEXT_PATTERN
 
 AMOUNT_RE = re.compile(
     r'^\s*(?:'
@@ -41,11 +47,219 @@ DOT_RE = re.compile(r'^\s*\.\s*$')
 
 MERCHANT_CUT_TOKENS = (" DES:", " ID:", " INDN:", " CO ID:")
 
-DATE_IN_TEXT_RE = re.compile(DATE_ANY_IN_TEXT_PATTERN)
+DATE_IN_TEXT_RE = re.compile(DATE_ANY_IN_TEXT_PATTERN, re.IGNORECASE)
+
+DATE_FULL_RE = re.compile(
+    rf'^\s*(?:{DATE_ANY_IN_TEXT_PATTERN})\s*$', re.IGNORECASE
+)
 
 DATE_MERCHANT_LINE_RE = re.compile(
-    rf'^\s*({DATE_ANY_IN_TEXT_PATTERN})\s+(.*\S)\s*$'
+    rf'^\s*({DATE_ANY_IN_TEXT_PATTERN})\s+(.*\S)\s*$', re.IGNORECASE
 )
+
+def convert_custom_date_format_to_regex(date_format: str) -> str:
+    """Convert one or more user date formats into a regex pattern.
+
+    Unified notation used by the UI:
+      M       month: numeric or English month name
+      MM      numeric month only
+      DD      day of month
+      YY      two-digit year
+      YYYY    four-digit year
+
+    Examples:
+      M-DD       -> 4-22
+      M DD       -> May 17
+      DD M       -> 17 May
+      M-DD-YYYY  -> 4-22-2025
+
+    Multiple formats may be separated by commas, Chinese commas, semicolons,
+    or vertical bars. Old tokens D, MON, MMM and MONTH remain accepted for
+    backward compatibility, but the UI only presents the unified notation.
+    """
+    raw = str(date_format or "").strip()
+    if not raw:
+        return DEFAULT_DATE_ANY_IN_TEXT_PATTERN
+
+    formats = [
+        part.strip()
+        for part in re.split(r'[,，;；|]+', raw)
+        if part.strip()
+    ]
+    if not formats:
+        return DEFAULT_DATE_ANY_IN_TEXT_PATTERN
+
+    month_name_pattern = (
+        r'(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|'
+        r'JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|'
+        r'OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)'
+    )
+    numeric_month_pattern = r'(?:1[0-2]|0?[1-9])'
+    day_pattern = r'(?:3[01]|[12]\d|0?[1-9])'
+
+    # M means Month and can therefore recognize either a numeric month
+    # (4) or an English month name (May/September).
+    any_month_pattern = rf'(?:{numeric_month_pattern}|{month_name_pattern})'
+
+    token_patterns = {
+        "YYYY": r"\d{4}",
+        "MONTH": any_month_pattern,
+        "MMM": any_month_pattern,
+        "MON": any_month_pattern,
+        "YY": r"\d{2}",
+        "MM": numeric_month_pattern,
+        "DD": day_pattern,
+        "M": any_month_pattern,
+        "D": day_pattern,  # legacy alias
+    }
+    token_order = ("YYYY", "MONTH", "MMM", "MON", "YY", "MM", "DD", "M", "D")
+
+    def one_format_to_regex(fmt_text: str) -> str:
+        fmt = fmt_text.strip().upper()
+        result = []
+        i = 0
+
+        while i < len(fmt):
+            matched = False
+            for token in token_order:
+                if fmt.startswith(token, i):
+                    result.append(token_patterns[token])
+                    i += len(token)
+                    matched = True
+                    break
+
+            if matched:
+                continue
+
+            current_char = fmt[i]
+            if current_char.isalpha():
+                raise ValueError(
+                    "无法识别的日期格式。请使用 M、MM、DD、YY、YYYY，"
+                    "例如 M-DD、M DD、DD M、M-DD-YYYY。"
+                )
+
+            if current_char.isspace():
+                while i < len(fmt) and fmt[i].isspace():
+                    i += 1
+                result.append(r"\s+")
+                continue
+
+            result.append(re.escape(current_char))
+            i += 1
+
+        return "".join(result)
+
+    patterns = [one_format_to_regex(fmt) for fmt in formats]
+    return patterns[0] if len(patterns) == 1 else r"(?:" + "|".join(patterns) + r")"
+
+
+
+def infer_date_format_from_sample(sample_text: str) -> str:
+    """Infer a unified date format from one user-entered date example.
+
+    Examples:
+      4-22       -> M-DD
+      04/22/25   -> M/DD/YY
+      2025-4-22  -> YYYY-M-DD
+      May 17     -> M DD
+      17 May     -> DD M
+    """
+    sample = " ".join(str(sample_text or "").strip().split())
+    if not sample:
+        raise ValueError("日期示例不能为空。")
+
+    month_names = (
+        r"JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|"
+        r"JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|"
+        r"OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?"
+    )
+
+    # English month first: May 17, May 17 2025, May-17-25
+    m = re.fullmatch(
+        rf"(?i)({month_names})([\s./-]+)(\d{{1,2}})(?:([\s./-]+)(\d{{2}}|\d{{4}}))?",
+        sample,
+    )
+    if m:
+        sep1 = m.group(2)
+        year = m.group(5)
+        fmt = f"M{sep1}DD"
+        if year:
+            fmt += f"{m.group(4)}{'YYYY' if len(year) == 4 else 'YY'}"
+        return fmt
+
+    # English month second: 17 May, 17 May 2025, 17-May-25
+    m = re.fullmatch(
+        rf"(?i)(\d{{1,2}})([\s./-]+)({month_names})(?:([\s./-]+)(\d{{2}}|\d{{4}}))?",
+        sample,
+    )
+    if m:
+        sep1 = m.group(2)
+        year = m.group(5)
+        fmt = f"DD{sep1}M"
+        if year:
+            fmt += f"{m.group(4)}{'YYYY' if len(year) == 4 else 'YY'}"
+        return fmt
+
+    # Numeric formats. A four-digit first field is treated as the year.
+    m = re.fullmatch(r"(\d{1,4})([./-])(\d{1,2})(?:([./-])(\d{2}|\d{4}))?", sample)
+    if m:
+        first, sep1, second, sep2, third = m.groups()
+        if len(first) == 4:
+            if third is None:
+                raise ValueError("年份在前的日期需要包含年、月、日，例如 2025-4-22。")
+            return f"YYYY{sep1}M{sep2}DD"
+
+        fmt = f"M{sep1}DD"
+        if third:
+            fmt += f"{sep2}{'YYYY' if len(third) == 4 else 'YY'}"
+        return fmt
+
+    raise ValueError(
+        "无法从日期示例中判断格式。请输入类似 4-22、04/22/2025、"
+        "2025-4-22、May 17 或 17 May。"
+    )
+
+
+def resolve_date_input_to_format(date_input: str) -> str:
+    """Accept either format tokens or real date examples and return formats.
+
+    Multiple entries may be separated by commas, semicolons, or vertical bars.
+    """
+    raw = str(date_input or "").strip()
+    if not raw:
+        return ""
+
+    parts = [p.strip() for p in re.split(r"[,，;；|]+", raw) if p.strip()]
+    resolved = []
+    format_token_re = re.compile(r"(?i)^(?:YYYY|YY|MM|M|DD|D|MMM|MON|MONTH|[\s./-])+$")
+
+    for part in parts:
+        if format_token_re.fullmatch(part):
+            resolved.append(part.upper())
+        else:
+            resolved.append(infer_date_format_from_sample(part))
+
+    return ", ".join(resolved)
+
+def configure_date_format(custom_date_format: str):
+    """Apply the custom date format, or restore defaults when blank."""
+    global DATE_ANY_IN_TEXT_PATTERN
+    global DATE_IN_TEXT_RE
+    global DATE_FULL_RE
+    global DATE_MERCHANT_LINE_RE
+
+    custom_date_format = resolve_date_input_to_format(custom_date_format)
+    DATE_ANY_IN_TEXT_PATTERN = (
+        convert_custom_date_format_to_regex(custom_date_format)
+        if custom_date_format
+        else DEFAULT_DATE_ANY_IN_TEXT_PATTERN
+    )
+
+    DATE_IN_TEXT_RE = re.compile(DATE_ANY_IN_TEXT_PATTERN, re.IGNORECASE)
+    DATE_FULL_RE = re.compile(rf'^\s*(?:{DATE_ANY_IN_TEXT_PATTERN})\s*$', re.IGNORECASE)
+    DATE_MERCHANT_LINE_RE = re.compile(
+        rf'^\s*({DATE_ANY_IN_TEXT_PATTERN})\s+(.*\S)\s*$', re.IGNORECASE
+    )
 
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', re.IGNORECASE)
 URLISH_RE = re.compile(r'(https?://|www\.|\.com\b|squareup\.com\b)', re.IGNORECASE)
@@ -108,7 +322,7 @@ def is_date_yyyy(s: str) -> bool:
     return bool(DATE_MMDDYYYY.match(s))
 
 def is_date_any(s: str) -> bool:
-    return is_date_short(s) or is_date_yy(s) or is_date_yyyy(s)
+    return bool(DATE_FULL_RE.match(str(s)))
 
 def is_amount(s: str) -> bool:
     return bool(AMOUNT_RE.match(s))
@@ -1167,59 +1381,27 @@ def mk_button(parent, text, cmd):
 def run_parser_ui():
     root = tk.Tk()
     root.title("BSDP")
-    root.geometry("1120x900")
+    root.geometry("1120x950")
     root.configure(bg=BG)
 
     mk_label(root, "BSDP", font=("Helvetica", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
 
-    default_statement = script_dir() / "statement.txt"
-    default_csv = script_dir() / "parsed_transactions.csv"
     default_monthly_summary = script_dir() / "credit_monthly_summary.xlsx"
 
-    in_var = tk.StringVar(value=str(default_statement))
-    out_var = tk.StringVar(value=str(default_csv.resolve()))
     summary_var = tk.StringVar(value=str(default_monthly_summary.resolve()))
     remove_var = tk.StringVar(value="")
+    date_format_var = tk.StringVar(value="")
     month_var = tk.StringVar(value="JAN")
     account_type_var = tk.StringVar(value="Credit")
     bank_name_var = tk.StringVar(value=DEFAULT_BANK_NAME)
 
     filebar = tk.Frame(root, bg=BG)
     filebar.pack(fill="x", padx=16, pady=(2, 8))
+    filebar.columnconfigure(1, weight=1)
 
-    mk_label(filebar, "输入文件(Input file)：").grid(row=0, column=0, sticky="w")
-    ent_in = tk.Entry(filebar, textvariable=in_var, width=78, bg="#111", fg=FG, insertbackground=FG, relief="flat")
-    ent_in.grid(row=0, column=1, padx=6, sticky="we")
-
-    def choose_in():
-        p = filedialog.asksaveasfilename(
-            title="选择/创建 statement.txt",
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
-        if p:
-            in_var.set(p)
-
-    mk_button(filebar, "更改(Browse)", choose_in).grid(row=0, column=2)
-
-    mk_label(filebar, "输出 CSV(Output CSV file)：").grid(row=1, column=0, sticky="w", pady=(8, 0))
-    ent_out = tk.Entry(filebar, textvariable=out_var, width=78, bg="#111", fg=FG, insertbackground=FG, relief="flat")
-    ent_out.grid(row=1, column=1, padx=6, pady=(8, 0), sticky="we")
-
-    def choose_out():
-        p = filedialog.asksaveasfilename(
-            title="保存为 CSV",
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv")]
-        )
-        if p:
-            out_var.set(p)
-
-    mk_button(filebar, "更改(Browse)", choose_out).grid(row=1, column=2, pady=(8, 0))
-
-    mk_label(filebar, "月份总表 Excel 保存位置(Monthly summary location)：").grid(row=2, column=0, sticky="w", pady=(8, 0))
+    mk_label(filebar, "月份总表 Excel 保存位置(Monthly summary location)：").grid(row=0, column=0, sticky="w")
     ent_summary = tk.Entry(filebar, textvariable=summary_var, width=78, bg="#111", fg=FG, insertbackground=FG, relief="flat")
-    ent_summary.grid(row=2, column=1, padx=6, pady=(8, 0), sticky="we")
+    ent_summary.grid(row=0, column=1, padx=6, sticky="we")
 
     def choose_summary():
         p = filedialog.asksaveasfilename(
@@ -1230,9 +1412,9 @@ def run_parser_ui():
         if p:
             summary_var.set(p)
 
-    mk_button(filebar, "更改(Browse)", choose_summary).grid(row=2, column=2, pady=(8, 0))
+    mk_button(filebar, "更改(Browse)", choose_summary).grid(row=0, column=2)
 
-    mk_label(filebar, "预处理删除内容(Preprocess remove text)：").grid(row=3, column=0, sticky="w", pady=(8, 0))
+    mk_label(filebar, "预处理删除内容(Preprocess remove text)：").grid(row=1, column=0, sticky="w", pady=(8, 0))
     ent_remove = tk.Entry(
         filebar,
         textvariable=remove_var,
@@ -1242,13 +1424,38 @@ def run_parser_ui():
         insertbackground=FG,
         relief="flat"
     )
-    ent_remove.grid(row=3, column=1, padx=6, pady=(8, 0), sticky="we")
+    ent_remove.grid(row=1, column=1, padx=6, pady=(8, 0), sticky="we")
 
     mk_label(
         filebar,
-        "例如: target, Mcdonald || 不同的关键字请使用，隔开",
+        "例如: target, Mcdonald || 不同的关键字请使用逗号隔开",
         fg="#9cdcfe"
-    ).grid(row=4, column=1, sticky="w", padx=6, pady=(4, 0))
+    ).grid(row=2, column=1, sticky="w", padx=6, pady=(4, 0))
+
+    mk_label(filebar, "日期示例或格式(Date example / format)：").grid(row=3, column=0, sticky="w", pady=(8, 0))
+    ent_date_format = tk.Entry(
+        filebar,
+        textvariable=date_format_var,
+        width=78,
+        bg="#111",
+        fg=FG,
+        insertbackground=FG,
+        relief="flat"
+    )
+    ent_date_format.grid(row=3, column=1, padx=6, pady=(8, 0), sticky="we")
+
+    date_help = (
+        "直接输入账单里的日期示例，程序会自动转换格式：\n"
+        "4-22 → M-DD    May 17 → M DD    17 May → DD M    "
+        "2025-4-22 → YYYY-M-DD\n"
+    )
+    mk_label(
+        filebar,
+        date_help,
+        fg="#9cdcfe",
+        justify="left",
+        anchor="w"
+    ).grid(row=4, column=1, columnspan=2, sticky="w", padx=6, pady=(4, 0))
 
     mk_label(filebar, "Bank Name（仅 Credit 表第一行使用）：").grid(row=5, column=0, sticky="w", pady=(8, 0))
     ent_bank = tk.Entry(
@@ -1351,16 +1558,14 @@ def run_parser_ui():
     txt_input.bind("<Return>", keep_cursor_visible)
     txt_input.bind("<<Paste>>", keep_cursor_visible)
 
-    def ensure_file(path_str: str) -> Path:
-        p = Path(path_str)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return p
-
     def start():
         try:
-            target = ensure_file(in_var.get() or str(default_statement))
+            # 直接处理文本框中的内容，不再生成 statement.txt。
             content = txt_input.get("1.0", "end-1c")
-            target.write_text(content, encoding="utf-8")
+
+            custom_date_input = date_format_var.get().strip()
+            resolved_date_format = resolve_date_input_to_format(custom_date_input)
+            configure_date_format(resolved_date_format)
 
             selected_month = month_var.get().strip().upper()
             if selected_month not in months:
@@ -1377,27 +1582,13 @@ def run_parser_ui():
 
             status.set(f"正在处理... 月份: {selected_month} | 类型: {selected_account_type.title()}")
 
-            text = target.read_text(encoding="utf-8", errors="ignore")
-            preprocessed_text = preprocess_statement_text(text, remove_items)
-            target.write_text(preprocessed_text, encoding="utf-8")
+            # 全部在内存中完成预处理和解析，不再生成以下中间文件：
+            # statement.txt、parsed_transactions.csv、parsed_transactions.txt、
+            # parsed_transactions.xlsx。
+            preprocessed_text = preprocess_statement_text(content, remove_items)
 
             hits = parse_auto(preprocessed_text)
             rows = [(h.merchant, h.amount, h.who) for h in hits]
-
-            out_csv = ensure_file(out_var.get())
-            with out_csv.open("w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["Merchant", "Amount"])
-                w.writerows([(m, a) for (m, a, _) in rows])
-
-            out_txt = out_csv.with_suffix(".txt")
-            out_txt.write_text(
-                "\n".join(f"{m} ${a}" for (m, a, _) in rows),
-                encoding="utf-8"
-            )
-
-            out_xlsx = out_csv.with_suffix(".xlsx")
-            write_merged_xlsx(out_xlsx, rows)
 
             summary_xlsx = get_summary_output_path(summary_var.get())
 
@@ -1418,11 +1609,18 @@ def run_parser_ui():
             status.set(
                 f"已完成 / Completed | 月份: {selected_month} | 类型: {selected_account_type.title()} | 总表: {summary_xlsx.name}"
             )
+            date_format_display = (
+                resolved_date_format
+                if resolved_date_format
+                else "默认格式 MM/DD、MM/DD/YY、MM/DD/YYYY"
+            )
+
             messagebox.showinfo(
                 "Completed",
                 f"提取成功: {len(rows)} 笔交易\n"
                 f"当前月份: {selected_month}\n"
                 f"当前类型: {selected_account_type.title()}\n"
+                f"日期格式: {date_format_display}\n"
                 f"总表文件: {summary_xlsx.name}\n"
                 f"分类规则文件: {category_rules_path()}\n"
             )
