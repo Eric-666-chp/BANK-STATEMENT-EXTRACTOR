@@ -4,7 +4,7 @@ import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Side, Font
@@ -309,6 +309,43 @@ CREDIT_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", 
 
 DEBIT_SHEET_NAME = "debit summary"
 DEBIT_MONTH_HEADERS = ["Jan", "Feb", "March", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+DEFAULT_UI_MONTH_LABELS = list(DEBIT_MONTH_HEADERS)
+
+def normalize_month_labels(labels) -> List[str]:
+    """Return exactly 12 non-empty display labels, preserving Excel order."""
+    cleaned = []
+    for value in list(labels or [])[:12]:
+        text = str(value).strip() if value is not None else ""
+        cleaned.append(text)
+    while len(cleaned) < 12:
+        cleaned.append(DEFAULT_UI_MONTH_LABELS[len(cleaned)])
+    return [label or DEFAULT_UI_MONTH_LABELS[i] for i, label in enumerate(cleaned)]
+
+def read_month_labels_from_wb(wb) -> List[str]:
+    """Read the 12 display labels already stored in the Monthly workbook."""
+    if DEBIT_SHEET_NAME in wb.sheetnames:
+        ws = wb[DEBIT_SHEET_NAME]
+        labels = [ws.cell(row=1, column=col).value for col in range(2, 14)]
+        if any(v is not None and str(v).strip() for v in labels):
+            return normalize_month_labels(labels)
+    if "Credit Summary" in wb.sheetnames:
+        ws = wb["Credit Summary"]
+        labels = [ws.cell(row=row, column=1).value for row in range(3, 15)]
+        if any(v is not None and str(v).strip() for v in labels):
+            return normalize_month_labels(labels)
+    return list(DEFAULT_UI_MONTH_LABELS)
+
+def read_month_labels_from_path(path: Path) -> List[str]:
+    if not path.exists():
+        return list(DEFAULT_UI_MONTH_LABELS)
+    try:
+        wb = load_workbook(path, data_only=False, read_only=True)
+        labels = read_month_labels_from_wb(wb)
+        wb.close()
+        return labels
+    except Exception:
+        return list(DEFAULT_UI_MONTH_LABELS)
 
 # ================= 基础工具 =================
 
@@ -1020,6 +1057,35 @@ def read_existing_debit_summary_from_wb(wb):
 
     return data
 
+def read_existing_debit_categories_from_wb(wb) -> Dict[str, str]:
+    """Read Merchant -> Category from the current debit summary.
+
+    This preserves categories imported from an existing company report instead
+    of replacing them every time new bank-statement data is appended.
+    """
+    categories: Dict[str, str] = {}
+
+    if DEBIT_SHEET_NAME not in wb.sheetnames:
+        return categories
+
+    ws = wb[DEBIT_SHEET_NAME]
+    for row in range(2, ws.max_row + 1):
+        merchant = ws.cell(row=row, column=1).value
+        if merchant is None:
+            continue
+
+        merchant_text = str(merchant).strip()
+        if not merchant_text or merchant_text.lower() == "total":
+            continue
+
+        category = ws.cell(row=row, column=15).value
+        category_text = str(category).strip() if category is not None else ""
+        if category_text:
+            categories[merchant_text] = category_text
+
+    return categories
+
+
 def style_debit_summary_sheet(ws, last_row: int):
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -1099,7 +1165,9 @@ def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui
         default_ws = wb.active
         default_ws.title = "Sheet"
 
+    month_labels = read_month_labels_from_wb(wb)
     existing = read_existing_debit_summary_from_wb(wb)
+    existing_categories = read_existing_debit_categories_from_wb(wb)
     merged = merge_same_merchants(rows)
     rules = load_category_rules()
 
@@ -1116,7 +1184,7 @@ def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui
 
     ws = wb.create_sheet(DEBIT_SHEET_NAME)
 
-    headers = ["Merchant"] + DEBIT_MONTH_HEADERS + ["Total", "Category"]
+    headers = ["Merchant"] + normalize_month_labels(month_labels) + ["Total", "Category"]
     for col_idx, h in enumerate(headers, start=1):
         ws.cell(row=1, column=col_idx, value=h)
 
@@ -1124,7 +1192,9 @@ def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui
 
     row_idx = 2
     for merchant in merchants_sorted:
-        category = get_category_for_merchant(merchant, rules)
+        category = existing_categories.get(merchant, "")
+        if not category:
+            category = get_category_for_merchant(merchant, rules)
 
         ws.cell(row=row_idx, column=1, value=merchant)
 
@@ -1191,6 +1261,7 @@ def write_or_update_credit_summary_xlsx(
         default_ws = wb.active
         default_ws.title = "Sheet"
 
+    month_labels = read_month_labels_from_wb(wb)
     old_bank_name, existing_dynamic_headers, existing_month_values = read_existing_credit_summary_from_wb(wb)
     final_bank_name = (bank_name or "").strip() or old_bank_name or DEFAULT_BANK_NAME
 
@@ -1217,8 +1288,8 @@ def write_or_update_credit_summary_xlsx(
     for idx, h in enumerate(headers, start=2):
         ws.cell(row=2, column=idx, value=h)
 
-    for month, row_idx in CREDIT_MONTH_ROWS.items():
-        ws.cell(row=row_idx, column=1, value=month)
+    for index, month in enumerate(CREDIT_MONTHS):
+        ws.cell(row=CREDIT_MONTH_ROWS[month], column=1, value=month_labels[index])
 
     ws.cell(row=15, column=1, value="TOTAL")
 
@@ -1332,6 +1403,426 @@ def write_or_update_credit_summary_xlsx(
 
     wb.save(xlsx_path)
 
+# ================= 已有公司报表模板导入 =================
+
+FIXED_CREDIT_HEADERS = {
+    CREDIT_BEGIN_HEADER,
+    CREDIT_TOTAL_HEADER,
+    CREDIT_DEBIT_HEADER,
+    CREDIT_ENDING_HEADER,
+}
+
+
+def normalized_cell_text(value) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def normalized_header_key(value) -> str:
+    return normalized_cell_text(value).upper()
+
+
+def find_header_row(ws, required_headers: List[str], max_scan_rows: int = 80) -> Optional[int]:
+    required = {h.upper() for h in required_headers}
+    limit = min(ws.max_row, max_scan_rows)
+
+    for row in range(1, limit + 1):
+        values = {
+            normalized_header_key(ws.cell(row=row, column=col).value)
+            for col in range(1, ws.max_column + 1)
+        }
+        if required.issubset(values):
+            return row
+    return None
+
+
+def find_column_by_header(ws, header_row: int, aliases: List[str]) -> Optional[int]:
+    alias_set = {a.upper() for a in aliases}
+    for col in range(1, ws.max_column + 1):
+        if normalized_header_key(ws.cell(row=header_row, column=col).value) in alias_set:
+            return col
+    return None
+
+
+def extract_expense_template_from_sheet(ws) -> List[Tuple[str, str]]:
+    """Extract only Merchant and Category; all historical amounts are ignored."""
+    header_row = find_header_row(ws, ["Merchant", "Category"])
+    if header_row is None:
+        return []
+
+    merchant_col = find_column_by_header(ws, header_row, ["Merchant", "Vendor", "Description"])
+    category_col = find_column_by_header(ws, header_row, ["Category", "Class"])
+    if merchant_col is None or category_col is None:
+        return []
+
+    rows: List[Tuple[str, str]] = []
+    seen = set()
+
+    for row in range(header_row + 1, ws.max_row + 1):
+        merchant = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+        category = normalized_cell_text(ws.cell(row=row, column=category_col).value)
+
+        if not merchant:
+            continue
+        if merchant.upper() in {"TOTAL", "GRAND TOTAL"}:
+            continue
+
+        key = merchant.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((merchant, category))
+
+    return rows
+
+
+def extract_income_headers_from_credit_layout(ws) -> List[str]:
+    """Find dynamic income columns from a Credit Summary-style report."""
+    limit = min(ws.max_row, 80)
+    for row in range(1, limit + 1):
+        values = [
+            normalized_header_key(ws.cell(row=row, column=col).value)
+            for col in range(1, ws.max_column + 1)
+        ]
+        value_set = set(values)
+
+        # Strong signal for the report layout already used by this program.
+        if CREDIT_TOTAL_HEADER in value_set and CREDIT_ENDING_HEADER in value_set:
+            headers: List[str] = []
+            for value in values:
+                if not value or value in FIXED_CREDIT_HEADERS:
+                    continue
+                if value in {"MONTH", "MERCHANT", "CATEGORY", "TOTAL", "AMOUNT"}:
+                    continue
+                if value not in headers:
+                    headers.append(value)
+            return headers
+    return []
+
+
+def extract_income_headers_from_merchant_layout(ws) -> List[str]:
+    """Support an Income sheet arranged like Merchant | Jan..Dec | Total | Category."""
+    header_row = find_header_row(ws, ["Merchant"])
+    if header_row is None:
+        return []
+
+    merchant_col = find_column_by_header(ws, header_row, ["Merchant", "Income", "Source", "Description"])
+    if merchant_col is None:
+        return []
+
+    headers: List[str] = []
+    seen = set()
+    for row in range(header_row + 1, ws.max_row + 1):
+        name = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+        if not name or name.upper() in {"TOTAL", "GRAND TOTAL"}:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        headers.append(normalize_credit_header_name(name))
+    return headers
+
+
+def display_cell_text(cell) -> str:
+    """Return a readable Excel cell value while preserving date-like labels."""
+    value = cell.value
+    if value is None:
+        return ""
+
+    # Excel date/datetime cells should be displayed using their own number format
+    # where possible, instead of Python's ``2026-01-01 00:00:00`` representation.
+    try:
+        if getattr(cell, "is_date", False) and hasattr(value, "strftime"):
+            fmt = str(cell.number_format or "").lower()
+            if "yyyy" in fmt:
+                return value.strftime("%m/%d/%Y")
+            if "yy" in fmt:
+                return value.strftime("%m/%d/%y")
+            return value.strftime("%m/%d")
+    except Exception:
+        pass
+
+    return normalized_cell_text(value)
+
+
+def extract_month_labels_from_sheet(ws) -> List[str]:
+    """Read 12 horizontal period/date headers from a Merchant-style sheet."""
+    header_row = find_header_row(ws, ["Merchant"])
+    if header_row is None:
+        return []
+    merchant_col = find_column_by_header(ws, header_row, ["Merchant", "Vendor", "Description"])
+    if merchant_col is None:
+        return []
+
+    total_col = find_column_by_header(ws, header_row, ["Total", "Amount Total", "Grand Total"])
+    category_col = find_column_by_header(ws, header_row, ["Category", "Class"])
+    end_col = total_col or category_col or (merchant_col + 13)
+    candidates = []
+    for col in range(merchant_col + 1, min(end_col, ws.max_column + 1)):
+        text = display_cell_text(ws.cell(row=header_row, column=col))
+        if text:
+            candidates.append(text)
+        if len(candidates) == 12:
+            break
+    return candidates if len(candidates) == 12 else []
+
+
+def extract_month_labels_from_income_sheet(ws) -> List[str]:
+    """Read the 12 date/period labels from the Income/Credit page.
+
+    Supported Income layouts:
+      1. Credit Summary layout: labels are vertically stored beside the
+         BEGIN BALANCE row, normally A3:A14.
+      2. Merchant layout: labels are horizontally stored in the header row.
+
+    The Income page is the authoritative source for UI labels.
+    """
+    # Credit Summary layout: locate the row containing BEGIN BALANCE and use
+    # the column immediately to its left as the period-label column.
+    limit = min(ws.max_row, 100)
+    begin_row = None
+    begin_col = None
+    for row in range(1, limit + 1):
+        for col in range(1, ws.max_column + 1):
+            if normalized_header_key(ws.cell(row=row, column=col).value) == CREDIT_BEGIN_HEADER:
+                begin_row, begin_col = row, col
+                break
+        if begin_row is not None:
+            break
+
+    if begin_row is not None and begin_col is not None and begin_col > 1:
+        label_col = begin_col - 1
+        candidates = []
+        for row in range(begin_row + 1, begin_row + 13):
+            text = display_cell_text(ws.cell(row=row, column=label_col))
+            if text:
+                candidates.append(text)
+            else:
+                candidates.append("")
+        if len(candidates) == 12 and any(candidates):
+            return normalize_month_labels(candidates)
+
+    # Fallback for an Income page arranged as Merchant | period1..period12.
+    return extract_month_labels_from_sheet(ws)
+
+
+def discover_source_report_structure(source_path: Path):
+    """Discover income names and expense Merchant/Category rows.
+
+    Amount cells from the source workbook are deliberately never imported.
+    """
+    wb = load_workbook(source_path, data_only=False)
+
+    income_headers: List[str] = []
+    expense_rows: List[Tuple[str, str]] = []
+    month_labels: List[str] = []
+
+    # Income is scanned first because its 12 date/period labels are the
+    # authoritative labels for both generated sheets and for the UI dropdown.
+    ordered_income_sheets = sorted(
+        wb.worksheets,
+        key=lambda ws: (0 if any(k in ws.title.lower() for k in ("income", "credit")) else 1)
+    )
+    for ws in ordered_income_sheets:
+        found = extract_income_headers_from_credit_layout(ws)
+        if not found and any(k in ws.title.lower() for k in ("income", "credit")):
+            found = extract_income_headers_from_merchant_layout(ws)
+
+        detected_labels = extract_month_labels_from_income_sheet(ws)
+        if found:
+            income_headers = found
+            if detected_labels:
+                month_labels = detected_labels
+            break
+
+    # Expense contributes only Merchant and Category. Its own date headers are
+    # deliberately ignored because the Income page controls the date labels.
+    ordered_expense_sheets = sorted(
+        wb.worksheets,
+        key=lambda ws: (0 if any(k in ws.title.lower() for k in ("expense", "debit")) else 1)
+    )
+    for ws in ordered_expense_sheets:
+        found = extract_expense_template_from_sheet(ws)
+        if found:
+            expense_rows = found
+            break
+
+    # Always keep the program's standard deposit column.
+    final_income_headers = [CREDIT_DEFAULT_HEADER]
+    for header in income_headers:
+        normalized = normalize_credit_header_name(header)
+        if normalized and normalized not in FIXED_CREDIT_HEADERS and normalized not in final_income_headers:
+            final_income_headers.append(normalized)
+
+    return final_income_headers, expense_rows, normalize_month_labels(month_labels)
+
+
+def create_credit_template_sheet(wb, income_headers: List[str], bank_name: str, month_labels: List[str]):
+    if "Credit Summary" in wb.sheetnames:
+        wb.remove(wb["Credit Summary"])
+
+    ws = wb.create_sheet("Credit Summary", 0)
+    ws.cell(row=1, column=2, value=(bank_name or DEFAULT_BANK_NAME).strip() or DEFAULT_BANK_NAME)
+
+    dynamic_headers = []
+    for header in income_headers:
+        normalized = normalize_credit_header_name(header)
+        if normalized and normalized not in FIXED_CREDIT_HEADERS and normalized not in dynamic_headers:
+            dynamic_headers.append(normalized)
+    if CREDIT_DEFAULT_HEADER not in dynamic_headers:
+        dynamic_headers.insert(0, CREDIT_DEFAULT_HEADER)
+
+    headers = [CREDIT_BEGIN_HEADER] + dynamic_headers + [
+        CREDIT_TOTAL_HEADER,
+        CREDIT_DEBIT_HEADER,
+        CREDIT_ENDING_HEADER,
+    ]
+
+    for col, header in enumerate(headers, start=2):
+        ws.cell(row=2, column=col, value=header)
+
+    month_labels = normalize_month_labels(month_labels)
+    for index, month in enumerate(CREDIT_MONTHS):
+        ws.cell(row=CREDIT_MONTH_ROWS[month], column=1, value=month_labels[index])
+    ws.cell(row=15, column=1, value="TOTAL")
+
+    header_col_map = {
+        normalized_cell_text(ws.cell(row=2, column=col).value): col
+        for col in range(2, len(headers) + 2)
+    }
+    begin_col = header_col_map[CREDIT_BEGIN_HEADER]
+    total_credit_col = header_col_map[CREDIT_TOTAL_HEADER]
+    debit_col = header_col_map[CREDIT_DEBIT_HEADER]
+    ending_col = header_col_map[CREDIT_ENDING_HEADER]
+    dynamic_start_col = header_col_map[dynamic_headers[0]]
+    dynamic_end_col = header_col_map[dynamic_headers[-1]]
+
+    # All imported historical amounts are intentionally blank.
+    ws.cell(row=CREDIT_MONTH_ROWS["JAN"], column=begin_col, value=0)
+    ws.cell(row=CREDIT_MONTH_ROWS["JAN"], column=begin_col).number_format = "0.00"
+
+    for index, month in enumerate(CREDIT_MONTHS):
+        row = CREDIT_MONTH_ROWS[month]
+        if index > 0:
+            previous_row = CREDIT_MONTH_ROWS[CREDIT_MONTHS[index - 1]]
+            previous_ending = ws.cell(row=previous_row, column=ending_col).coordinate
+            ws.cell(row=row, column=begin_col, value=f"={previous_ending}")
+
+        start_ref = ws.cell(row=row, column=dynamic_start_col).coordinate
+        end_ref = ws.cell(row=row, column=dynamic_end_col).coordinate
+        ws.cell(row=row, column=total_credit_col, value=f"=SUM({start_ref}:{end_ref})")
+
+        begin_ref = ws.cell(row=row, column=begin_col).coordinate
+        total_credit_ref = ws.cell(row=row, column=total_credit_col).coordinate
+        debit_ref = ws.cell(row=row, column=debit_col).coordinate
+        ws.cell(row=row, column=ending_col, value=f"={begin_ref}+{total_credit_ref}-{debit_ref}")
+
+    # Annual formulas remain formulas, not pasted values.
+    for header in dynamic_headers:
+        col = header_col_map[header]
+        start_ref = ws.cell(row=CREDIT_MONTH_ROWS["JAN"], column=col).coordinate
+        end_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=col).coordinate
+        ws.cell(row=15, column=col, value=f"=SUM({start_ref}:{end_ref})")
+
+    start_ref = ws.cell(row=CREDIT_MONTH_ROWS["JAN"], column=total_credit_col).coordinate
+    end_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=total_credit_col).coordinate
+    ws.cell(row=15, column=total_credit_col, value=f"=SUM({start_ref}:{end_ref})")
+
+    start_ref = ws.cell(row=CREDIT_MONTH_ROWS["JAN"], column=debit_col).coordinate
+    end_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=debit_col).coordinate
+    ws.cell(row=15, column=debit_col, value=f"=SUM({start_ref}:{end_ref})")
+
+    dec_ending_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=ending_col).coordinate
+    ws.cell(row=15, column=ending_col, value=f"={dec_ending_ref}")
+
+    last_col = 1 + len(headers)
+    style_credit_sheet(ws, last_col)
+    ws.auto_filter.ref = f"A2:{excel_col_letter(last_col)}15"
+
+
+def create_debit_template_sheet(wb, expense_rows: List[Tuple[str, str]], month_labels: List[str]):
+    if DEBIT_SHEET_NAME in wb.sheetnames:
+        wb.remove(wb[DEBIT_SHEET_NAME])
+
+    ws = wb.create_sheet(DEBIT_SHEET_NAME)
+    headers = ["Merchant"] + month_labels + ["Total", "Category"]
+    for col, header in enumerate(headers, start=1):
+        ws.cell(row=1, column=col, value=header)
+
+    row = 2
+    for merchant, category in expense_rows:
+        ws.cell(row=row, column=1, value=merchant)
+        # Jan-Dec remain blank. Total is still a live formula.
+        ws.cell(row=row, column=14, value=f"=SUM(B{row}:M{row})")
+        ws.cell(row=row, column=14).number_format = "0.00"
+        ws.cell(row=row, column=15, value=category)
+        row += 1
+
+    total_row = row
+    ws.cell(row=total_row, column=1, value="Total")
+    for col in range(2, 14):
+        letter = excel_col_letter(col)
+        if total_row > 2:
+            ws.cell(row=total_row, column=col, value=f"=SUM({letter}2:{letter}{total_row - 1})")
+            ws.cell(row=total_row, column=col).number_format = "0.00"
+    if total_row > 2:
+        ws.cell(row=total_row, column=14, value=f"=SUM(B{total_row}:M{total_row})")
+        ws.cell(row=total_row, column=14).number_format = "0.00"
+
+    style_debit_summary_sheet(ws, total_row)
+
+
+def import_existing_report_template(
+    source_path: Path,
+    target_path: Path,
+    bank_name: str = DEFAULT_BANK_NAME,
+):
+    """Initialize Monthly Summary from an existing company workbook.
+
+    Imported:
+      * Income names/headers only
+      * Expense Merchant and Category only
+
+    Not imported:
+      * Any historical income amount
+      * Any historical expense amount
+
+    All Monthly Summary formulas are freshly created and preserved as formulas.
+    """
+    source_path = Path(source_path)
+    target_path = Path(target_path)
+
+    if not source_path.exists():
+        raise FileNotFoundError(f"找不到源 Excel：{source_path}")
+    if source_path.suffix.lower() != ".xlsx":
+        raise ValueError("目前只支持 .xlsx 文件。")
+    if source_path.resolve() == target_path.resolve():
+        raise ValueError("源报表和 Monthly Summary 不能是同一个文件。")
+
+    income_headers, expense_rows, month_labels = discover_source_report_structure(source_path)
+    if len(income_headers) <= 1 and not expense_rows:
+        raise ValueError(
+            "无法识别源报表结构。请确认报表中存在 Income/Credit 区域，"
+            "以及包含 Merchant 和 Category 表头的 Expense 区域。"
+        )
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    default_ws = wb.active
+
+    create_credit_template_sheet(wb, income_headers, bank_name, month_labels)
+    create_debit_template_sheet(wb, expense_rows, month_labels)
+    sync_credit_debit_from_debit_sheet(wb)
+
+    if default_ws in wb.worksheets:
+        wb.remove(default_ws)
+
+    wb.save(target_path)
+    return len(income_headers), len(expense_rows), month_labels
+
+
 # ================= 输出路径 =================
 
 def get_summary_output_path(base_path_str: str) -> Path:
@@ -1391,7 +1882,8 @@ def run_parser_ui():
     summary_var = tk.StringVar(value=str(default_monthly_summary.resolve()))
     remove_var = tk.StringVar(value="")
     date_format_var = tk.StringVar(value="")
-    month_var = tk.StringVar(value="JAN")
+    initial_month_labels = read_month_labels_from_path(default_monthly_summary)
+    month_var = tk.StringVar(value=initial_month_labels[0])
     account_type_var = tk.StringVar(value="Credit")
     bank_name_var = tk.StringVar(value=DEFAULT_BANK_NAME)
 
@@ -1411,6 +1903,10 @@ def run_parser_ui():
         )
         if p:
             summary_var.set(p)
+            detected = read_month_labels_from_path(get_summary_output_path(p))
+            months[:] = detected
+            month_box["values"] = months
+            month_var.set(months[0])
 
     mk_button(filebar, "更改(Browse)", choose_summary).grid(row=0, column=2)
 
@@ -1511,7 +2007,7 @@ def run_parser_ui():
         font=("Helvetica", 12)
     ).pack(side="left", anchor="w")
 
-    months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+    months = list(initial_month_labels)
 
     month_box = ttk.Combobox(
         title_row,
@@ -1521,8 +2017,8 @@ def run_parser_ui():
         state="readonly"
     )
     month_box.pack(side="left", padx=(10, 6))
-    month_box.set("JAN")
-    month_var.set("JAN")
+    month_box.set(months[0])
+    month_var.set(months[0])
     month_box.bind("<<ComboboxSelected>>", on_month_selected)
 
     account_type_box = ttk.Combobox(
@@ -1558,6 +2054,49 @@ def run_parser_ui():
     txt_input.bind("<Return>", keep_cursor_visible)
     txt_input.bind("<<Paste>>", keep_cursor_visible)
 
+    def import_existing_report():
+        source = filedialog.askopenfilename(
+            title="选择已有公司报表 Excel",
+            filetypes=[("Excel files", "*.xlsx")]
+        )
+        if not source:
+            return
+
+        try:
+            target = get_summary_output_path(summary_var.get())
+            if target.exists():
+                overwrite = messagebox.askyesno(
+                    "Monthly Summary 已存在",
+                    f"目标文件已经存在：\n{target}\n\n"
+                    "初始化会重新建立 Credit Summary 和 debit summary，"
+                    "并清空已有月份金额。所有公式会重新生成。\n\n是否继续？"
+                )
+                if not overwrite:
+                    return
+
+            status.set("正在导入已有报表模板...")
+            income_count, expense_count, imported_month_labels = import_existing_report_template(
+                Path(source),
+                target,
+                bank_name=bank_name_var.get().strip() or DEFAULT_BANK_NAME,
+            )
+            months[:] = normalize_month_labels(imported_month_labels)
+            month_box["values"] = months
+            month_var.set(months[0])
+            status.set(f"模板导入完成：{target.name} | UI 日期已匹配 Excel")
+            messagebox.showinfo(
+                "导入完成",
+                f"Monthly Summary 已建立：\n{target}\n\n"
+                f"Income 项目：{income_count}\n"
+                f"Expense Merchant：{expense_count}\n\n"
+                "历史金额没有导入；所有月份金额为空，公式已正常建立。\n"
+                f"UI 日期顺序：{', '.join(months)}"
+            )
+        except Exception as e:
+            status.set(f"模板导入失败：{type(e).__name__}: {e}")
+            messagebox.showerror("导入失败", f"{type(e).__name__}: {e}")
+
+
     def start():
         try:
             # 直接处理文本框中的内容，不再生成 statement.txt。
@@ -1567,10 +2106,11 @@ def run_parser_ui():
             resolved_date_format = resolve_date_input_to_format(custom_date_input)
             configure_date_format(resolved_date_format)
 
-            selected_month = month_var.get().strip().upper()
-            if selected_month not in months:
-                messagebox.showerror("错误", "请选择有效月份")
+            selected_month_display = month_var.get().strip()
+            if selected_month_display not in months:
+                messagebox.showerror("错误", "请选择有效日期/月份")
                 return
+            selected_month = CREDIT_MONTHS[months.index(selected_month_display)]
 
             selected_account_type = account_type_var.get().strip().lower()
             if selected_account_type not in ("credit", "debit"):
@@ -1580,7 +2120,7 @@ def run_parser_ui():
             bank_name = bank_name_var.get().strip() or DEFAULT_BANK_NAME
             remove_items = parse_remove_items(remove_var.get())
 
-            status.set(f"正在处理... 月份: {selected_month} | 类型: {selected_account_type.title()}")
+            status.set(f"正在处理... 日期: {selected_month_display} | 类型: {selected_account_type.title()}")
 
             # 全部在内存中完成预处理和解析，不再生成以下中间文件：
             # statement.txt、parsed_transactions.csv、parsed_transactions.txt、
@@ -1607,7 +2147,7 @@ def run_parser_ui():
                 )
 
             status.set(
-                f"已完成 / Completed | 月份: {selected_month} | 类型: {selected_account_type.title()} | 总表: {summary_xlsx.name}"
+                f"已完成 / Completed | 日期: {selected_month_display} | 类型: {selected_account_type.title()} | 总表: {summary_xlsx.name}"
             )
             date_format_display = (
                 resolved_date_format
@@ -1618,7 +2158,7 @@ def run_parser_ui():
             messagebox.showinfo(
                 "Completed",
                 f"提取成功: {len(rows)} 笔交易\n"
-                f"当前月份: {selected_month}\n"
+                f"当前日期: {selected_month_display}\n"
                 f"当前类型: {selected_account_type.title()}\n"
                 f"日期格式: {date_format_display}\n"
                 f"总表文件: {summary_xlsx.name}\n"
@@ -1634,8 +2174,9 @@ def run_parser_ui():
 
     btns = tk.Frame(root, bg=BG)
     btns.pack(pady=12)
-    mk_button(btns, "Start", start).grid(row=0, column=0, padx=8)
-    mk_button(btns, "Stop", stop).grid(row=0, column=1, padx=8)
+    mk_button(btns, "导入已有报表模板", import_existing_report).grid(row=0, column=0, padx=8)
+    mk_button(btns, "Start", start).grid(row=0, column=1, padx=8)
+    mk_button(btns, "Stop", stop).grid(row=0, column=2, padx=8)
 
     root.mainloop()
 
