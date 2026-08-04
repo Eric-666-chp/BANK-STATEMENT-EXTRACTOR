@@ -1774,66 +1774,464 @@ def create_debit_template_sheet(wb, expense_rows: List[Tuple[str, str]], month_l
     style_debit_summary_sheet(ws, total_row)
 
 
+def clear_credit_amounts_keep_layout(ws) -> int:
+    """Clear historical Credit amounts in-place while preserving sheet name/layout."""
+    header_row, header_map = find_credit_layout(ws)
+    if header_row is None:
+        return 0
+
+    begin_col = header_map[CREDIT_BEGIN_HEADER]
+    total_credit_col = header_map[CREDIT_TOTAL_HEADER]
+    debit_col = header_map[CREDIT_DEBIT_HEADER]
+    ending_col = header_map[CREDIT_ENDING_HEADER]
+    first_data_row = header_row + 1
+    last_data_row = header_row + 12
+    total_row = header_row + 13
+
+    dynamic_cols = list(range(begin_col + 1, total_credit_col))
+    for row in range(first_data_row, last_data_row + 1):
+        for col in dynamic_cols:
+            ws.cell(row=row, column=col).value = None
+        ws.cell(row=row, column=debit_col).value = None
+
+    # Rebuild the controlled formulas without renaming or recreating the sheet.
+    if first_data_row <= ws.max_row:
+        ws.cell(row=first_data_row, column=begin_col, value=0)
+        ws.cell(row=first_data_row, column=begin_col).number_format = "0.00"
+
+    for row in range(first_data_row, last_data_row + 1):
+        if row > first_data_row:
+            prev_end = ws.cell(row=row - 1, column=ending_col).coordinate
+            ws.cell(row=row, column=begin_col, value=f"={prev_end}")
+        if dynamic_cols:
+            start_ref = ws.cell(row=row, column=dynamic_cols[0]).coordinate
+            end_ref = ws.cell(row=row, column=dynamic_cols[-1]).coordinate
+            ws.cell(row=row, column=total_credit_col, value=f"=SUM({start_ref}:{end_ref})")
+        else:
+            ws.cell(row=row, column=total_credit_col, value=0)
+        begin_ref = ws.cell(row=row, column=begin_col).coordinate
+        credit_ref = ws.cell(row=row, column=total_credit_col).coordinate
+        debit_ref = ws.cell(row=row, column=debit_col).coordinate
+        ws.cell(row=row, column=ending_col, value=f"={begin_ref}+{credit_ref}-{debit_ref}")
+
+    for col in dynamic_cols + [total_credit_col, debit_col]:
+        start_ref = ws.cell(row=first_data_row, column=col).coordinate
+        end_ref = ws.cell(row=last_data_row, column=col).coordinate
+        ws.cell(row=total_row, column=col, value=f"=SUM({start_ref}:{end_ref})")
+    ws.cell(row=total_row, column=ending_col,
+            value=f"={ws.cell(row=last_data_row, column=ending_col).coordinate}")
+    return len(dynamic_cols)
+
+
+def clear_debit_amounts_keep_layout(ws) -> int:
+    """Clear historical Debit amounts in-place; keep Merchant/Category and sheet name."""
+    layout = find_debit_layout(ws)
+    if layout is None:
+        return 0
+    header_row, merchant_col, month_cols, total_col, category_col = layout
+
+    total_row = None
+    merchant_count = 0
+    for row in range(header_row + 1, ws.max_row + 1):
+        merchant = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+        if not merchant:
+            continue
+        if merchant.upper() in {"TOTAL", "GRAND TOTAL"}:
+            total_row = row
+            break
+        merchant_count += 1
+        for col in month_cols:
+            ws.cell(row=row, column=col).value = None
+        start_ref = ws.cell(row=row, column=month_cols[0]).coordinate
+        end_ref = ws.cell(row=row, column=month_cols[-1]).coordinate
+        ws.cell(row=row, column=total_col, value=f"=SUM({start_ref}:{end_ref})")
+        ws.cell(row=row, column=total_col).number_format = "0.00"
+
+    if total_row is None:
+        total_row = ws.max_row + 1
+        ws.cell(row=total_row, column=merchant_col, value="Total")
+
+    first_data_row = header_row + 1
+    last_data_row = total_row - 1
+    if last_data_row >= first_data_row:
+        for col in month_cols:
+            letter = excel_col_letter(col)
+            ws.cell(row=total_row, column=col,
+                    value=f"=SUM({letter}{first_data_row}:{letter}{last_data_row})")
+            ws.cell(row=total_row, column=col).number_format = "0.00"
+        start_ref = ws.cell(row=total_row, column=month_cols[0]).coordinate
+        end_ref = ws.cell(row=total_row, column=month_cols[-1]).coordinate
+        ws.cell(row=total_row, column=total_col, value=f"=SUM({start_ref}:{end_ref})")
+        ws.cell(row=total_row, column=total_col).number_format = "0.00"
+    return merchant_count
+
+
 def import_existing_report_template(
     source_path: Path,
     target_path: Path,
     bank_name: str = DEFAULT_BANK_NAME,
 ):
-    """Initialize Monthly Summary from an existing company workbook.
+    """完整复制源工作簿的所有工作表，并保留原始名称和顺序。
 
-    Imported:
-      * Income names/headers only
-      * Expense Merchant and Category only
-
-    Not imported:
-      * Any historical income amount
-      * Any historical expense amount
-
-    All Monthly Summary formulas are freshly created and preserved as formulas.
+    这个版本不会重新创建 Credit Summary / debit summary，也不会只提取
+    前两个工作表。它先把整个源 .xlsx 文件复制到临时文件，再验证源文件
+    与复制文件的 sheetnames 完全一致，最后才清理可识别页面中的旧金额。
     """
-    source_path = Path(source_path)
-    target_path = Path(target_path)
+    import shutil
+    import tempfile
+
+    source_path = Path(source_path).expanduser().resolve()
+    target_path = Path(target_path).expanduser().resolve()
 
     if not source_path.exists():
         raise FileNotFoundError(f"找不到源 Excel：{source_path}")
     if source_path.suffix.lower() != ".xlsx":
         raise ValueError("目前只支持 .xlsx 文件。")
-    if source_path.resolve() == target_path.resolve():
-        raise ValueError("源报表和 Monthly Summary 不能是同一个文件。")
+    if source_path == target_path:
+        raise ValueError("源报表和目标 Excel 不能是同一个文件。")
 
-    income_headers, expense_rows, month_labels = discover_source_report_structure(source_path)
-    if len(income_headers) <= 1 and not expense_rows:
-        raise ValueError(
-            "无法识别源报表结构。请确认报表中存在 Income/Credit 区域，"
-            "以及包含 Merchant 和 Category 表头的 Expense 区域。"
-        )
+    # 先读取源工作簿并记录所有工作表名称。这里包含隐藏工作表。
+    source_wb = load_workbook(source_path, read_only=True, data_only=False)
+    try:
+        source_sheet_names = list(source_wb.sheetnames)
+    finally:
+        source_wb.close()
+
+    if not source_sheet_names:
+        raise ValueError("源 Excel 中没有可读取的工作表。")
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    wb = Workbook()
-    default_ws = wb.active
 
-    create_credit_template_sheet(wb, income_headers, bank_name, month_labels)
-    create_debit_template_sheet(wb, expense_rows, month_labels)
-    sync_credit_debit_from_debit_sheet(wb)
+    # 使用同目录临时文件，避免覆盖过程中出现只剩部分工作表的损坏文件。
+    fd, temp_name = tempfile.mkstemp(
+        prefix=target_path.stem + "_import_",
+        suffix=".xlsx",
+        dir=str(target_path.parent),
+    )
+    import os
+    os.close(fd)
+    temp_path = Path(temp_name)
 
-    if default_ws in wb.worksheets:
-        wb.remove(default_ws)
+    try:
+        shutil.copyfile(source_path, temp_path)
 
-    wb.save(target_path)
-    return len(income_headers), len(expense_rows), month_labels
+        # 第一次验证：整本复制后，所有 sheet 名称和顺序必须完全一致。
+        check_wb = load_workbook(temp_path, read_only=True, data_only=False)
+        try:
+            copied_sheet_names = list(check_wb.sheetnames)
+        finally:
+            check_wb.close()
 
+        if copied_sheet_names != source_sheet_names:
+            raise RuntimeError(
+                "工作表复制验证失败。\n"
+                f"源文件工作表({len(source_sheet_names)}): {source_sheet_names}\n"
+                f"复制后工作表({len(copied_sheet_names)}): {copied_sheet_names}"
+            )
+
+        wb = load_workbook(temp_path, data_only=False)
+        try:
+            credit_item_count = 0
+            debit_merchant_count = 0
+            month_labels: List[str] = []
+
+            # 注意：这里只修改工作表内容，绝不 remove/create/rename worksheet。
+            for ws in list(wb.worksheets):
+                if not month_labels:
+                    labels = extract_month_labels_from_income_sheet(ws)
+                    if not labels:
+                        labels = extract_month_labels_from_sheet(ws)
+                    if labels:
+                        month_labels = normalize_month_labels(labels)
+
+                header_row, _ = find_credit_layout(ws)
+                if header_row is not None:
+                    credit_item_count += clear_credit_amounts_keep_layout(ws)
+                    continue
+
+                if find_debit_layout(ws) is not None:
+                    debit_merchant_count += clear_debit_amounts_keep_layout(ws)
+
+            # 保存前再次确认代码没有意外删除、增加或改名。
+            before_save_names = list(wb.sheetnames)
+            if before_save_names != source_sheet_names:
+                raise RuntimeError(
+                    "处理过程中工作表名称或数量发生变化。\n"
+                    f"源文件: {source_sheet_names}\n处理后: {before_save_names}"
+                )
+            wb.save(temp_path)
+        finally:
+            wb.close()
+
+        # 第二次验证：保存并重新打开后，仍然必须保留全部工作表。
+        final_check_wb = load_workbook(temp_path, read_only=True, data_only=False)
+        try:
+            final_sheet_names = list(final_check_wb.sheetnames)
+        finally:
+            final_check_wb.close()
+
+        if final_sheet_names != source_sheet_names:
+            raise RuntimeError(
+                "保存后的工作表验证失败。\n"
+                f"源文件工作表({len(source_sheet_names)}): {source_sheet_names}\n"
+                f"保存后工作表({len(final_sheet_names)}): {final_sheet_names}"
+            )
+
+        # 所有验证通过后再替换正式目标文件。
+        os.replace(temp_path, target_path)
+
+        return (
+            credit_item_count,
+            debit_merchant_count,
+            normalize_month_labels(month_labels),
+            final_sheet_names,
+        )
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+# ================= 多工作表读取与原位追加 =================
+
+def list_workbook_sheet_names(path: Path) -> List[str]:
+    path = Path(path)
+    if not path.exists():
+        return []
+    wb = load_workbook(path, read_only=True, data_only=False)
+    try:
+        return list(wb.sheetnames)
+    finally:
+        wb.close()
+
+
+def read_month_labels_from_selected_sheet(path: Path, sheet_name: str, account_type: str) -> List[str]:
+    path = Path(path)
+    if not path.exists() or not sheet_name:
+        return list(DEFAULT_UI_MONTH_LABELS)
+    wb = load_workbook(path, read_only=True, data_only=False)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return list(DEFAULT_UI_MONTH_LABELS)
+        ws = wb[sheet_name]
+        if str(account_type).strip().lower() == "credit":
+            labels = extract_month_labels_from_income_sheet(ws)
+        else:
+            labels = extract_month_labels_from_sheet(ws)
+        return normalize_month_labels(labels) if labels else list(DEFAULT_UI_MONTH_LABELS)
+    finally:
+        wb.close()
+
+
+def append_amount_to_cell(cell, amounts: List[str]):
+    parts = split_formula_parts(cell.value)
+    parts.extend(normalize_amount_string(a) for a in amounts)
+    formula = build_plus_formula(parts)
+    cell.value = formula if formula else None
+    cell.number_format = "0.00"
+
+
+def copy_row_style(ws, source_row: int, target_row: int, max_col: int):
+    from copy import copy
+    if source_row < 1:
+        return
+    for col in range(1, max_col + 1):
+        src = ws.cell(row=source_row, column=col)
+        dst = ws.cell(row=target_row, column=col)
+        if src.has_style:
+            dst._style = copy(src._style)
+        dst.alignment = copy(src.alignment)
+        dst.border = copy(src.border)
+        dst.fill = copy(src.fill)
+        dst.font = copy(src.font)
+        dst.protection = copy(src.protection)
+        dst.number_format = src.number_format
+    ws.row_dimensions[target_row].height = ws.row_dimensions[source_row].height
+
+
+def copy_column_style(ws, source_col: int, target_col: int, max_row: int):
+    from copy import copy
+    if source_col < 1:
+        return
+    source_letter = excel_col_letter(source_col)
+    target_letter = excel_col_letter(target_col)
+    ws.column_dimensions[target_letter].width = ws.column_dimensions[source_letter].width
+    for row in range(1, max_row + 1):
+        src = ws.cell(row=row, column=source_col)
+        dst = ws.cell(row=row, column=target_col)
+        if src.has_style:
+            dst._style = copy(src._style)
+        dst.alignment = copy(src.alignment)
+        dst.border = copy(src.border)
+        dst.fill = copy(src.fill)
+        dst.font = copy(src.font)
+        dst.protection = copy(src.protection)
+        dst.number_format = src.number_format
+
+
+def find_credit_layout(ws):
+    limit = min(ws.max_row, 100)
+    for row in range(1, limit + 1):
+        header_map = {}
+        for col in range(1, ws.max_column + 1):
+            key = normalized_header_key(ws.cell(row=row, column=col).value)
+            if key:
+                header_map[key] = col
+        required = {CREDIT_BEGIN_HEADER, CREDIT_TOTAL_HEADER, CREDIT_DEBIT_HEADER, CREDIT_ENDING_HEADER}
+        if required.issubset(header_map):
+            return row, header_map
+    return None, {}
+
+
+def find_debit_layout(ws):
+    header_row = find_header_row(ws, ["Merchant"])
+    if header_row is None:
+        return None
+    merchant_col = find_column_by_header(ws, header_row, ["Merchant", "Vendor", "Description"])
+    total_col = find_column_by_header(ws, header_row, ["Total", "Amount Total", "Grand Total"])
+    category_col = find_column_by_header(ws, header_row, ["Category", "Class"])
+    if merchant_col is None or total_col is None:
+        return None
+    month_cols = list(range(merchant_col + 1, merchant_col + 13))
+    if month_cols[-1] >= total_col:
+        return None
+    return header_row, merchant_col, month_cols, total_col, category_col
+
+
+def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name: str = DEFAULT_BANK_NAME):
+    header_row, header_map = find_credit_layout(ws)
+    if header_row is None:
+        raise ValueError(f"工作表“{ws.title}”不是可识别的 Credit 格式。")
+    begin_col = header_map[CREDIT_BEGIN_HEADER]
+    month_row = header_row + 1 + selected_month_index
+    if month_row > ws.max_row:
+        raise ValueError(f"工作表“{ws.title}”没有完整的 12 个日期/月份行。")
+    if begin_col > 1:
+        bank_cell = ws.cell(row=max(1, header_row - 1), column=begin_col)
+        if bank_cell.value is None or str(bank_cell.value).strip() == "":
+            bank_cell.value = bank_name
+    merged = merge_same_merchants(rows)
+    fixed = {CREDIT_BEGIN_HEADER, CREDIT_TOTAL_HEADER, CREDIT_DEBIT_HEADER, CREDIT_ENDING_HEADER}
+    def refresh_map():
+        return {normalized_header_key(ws.cell(row=header_row, column=c).value): c
+                for c in range(1, ws.max_column + 1)
+                if normalized_header_key(ws.cell(row=header_row, column=c).value)}
+    for merchant, data in merged.items():
+        target_header = classify_credit_column(merchant)
+        current_map = refresh_map()
+        target_col = current_map.get(target_header)
+        if target_col is None:
+            current_total_col = current_map[CREDIT_TOTAL_HEADER]
+            ws.insert_cols(current_total_col, 1)
+            copy_column_style(ws, max(begin_col + 1, current_total_col - 1), current_total_col,
+                              max(ws.max_row, header_row + 13))
+            ws.cell(row=header_row, column=current_total_col, value=target_header)
+            for r in range(header_row + 1, header_row + 13):
+                ws.cell(row=r, column=current_total_col, value=None)
+                ws.cell(row=r, column=current_total_col).number_format = "0.00"
+            target_col = current_total_col
+        append_amount_to_cell(ws.cell(row=month_row, column=target_col), data["amounts"])
+    current_map = refresh_map()
+    begin_col = current_map[CREDIT_BEGIN_HEADER]
+    total_credit_col = current_map[CREDIT_TOTAL_HEADER]
+    debit_col = current_map[CREDIT_DEBIT_HEADER]
+    ending_col = current_map[CREDIT_ENDING_HEADER]
+    dynamic_cols = [c for c in range(begin_col + 1, total_credit_col)
+                    if normalized_header_key(ws.cell(row=header_row, column=c).value) not in fixed]
+    if not dynamic_cols:
+        raise ValueError(f"工作表“{ws.title}”没有可写入的 Credit 收入栏。")
+    first_data_row, last_data_row, total_row = header_row + 1, header_row + 12, header_row + 13
+    for r in range(first_data_row, last_data_row + 1):
+        a = ws.cell(r, dynamic_cols[0]).coordinate
+        b = ws.cell(r, dynamic_cols[-1]).coordinate
+        ws.cell(r, total_credit_col, f"=SUM({a}:{b})")
+        ws.cell(r, ending_col, f"={ws.cell(r, begin_col).coordinate}+{ws.cell(r, total_credit_col).coordinate}-{ws.cell(r, debit_col).coordinate}")
+    for c in dynamic_cols + [total_credit_col, debit_col]:
+        ws.cell(total_row, c, f"=SUM({ws.cell(first_data_row,c).coordinate}:{ws.cell(last_data_row,c).coordinate})")
+    ws.cell(total_row, ending_col, f"={ws.cell(last_data_row, ending_col).coordinate}")
+
+
+def update_debit_sheet_in_place(ws, rows, selected_month_index: int):
+    layout = find_debit_layout(ws)
+    if layout is None:
+        raise ValueError(f"工作表“{ws.title}”不是可识别的 Debit 格式。")
+    header_row, merchant_col, month_cols, total_col, category_col = layout
+    selected_col = month_cols[selected_month_index]
+    rules = load_category_rules()
+    merged = merge_same_merchants(rows)
+    total_row = None
+    merchant_rows = {}
+    for r in range(header_row + 1, ws.max_row + 1):
+        name = normalized_cell_text(ws.cell(r, merchant_col).value)
+        if not name:
+            continue
+        if name.upper() in {"TOTAL", "GRAND TOTAL"}:
+            total_row = r
+            break
+        merchant_rows[name.casefold()] = r
+    if total_row is None:
+        total_row = ws.max_row + 1
+        ws.cell(total_row, merchant_col, "Total")
+    for merchant, data in merged.items():
+        r = merchant_rows.get(merchant.casefold())
+        if r is None:
+            ws.insert_rows(total_row, 1)
+            copy_row_style(ws, max(header_row + 1, total_row - 1), total_row, ws.max_column)
+            r = total_row
+            total_row += 1
+            ws.cell(r, merchant_col, merchant)
+            for c in month_cols:
+                ws.cell(r, c, None)
+            if category_col is not None:
+                ws.cell(r, category_col, get_category_for_merchant(merchant, rules))
+            merchant_rows[merchant.casefold()] = r
+        append_amount_to_cell(ws.cell(r, selected_col), data["amounts"])
+        ws.cell(r, total_col, f"=SUM({ws.cell(r,month_cols[0]).coordinate}:{ws.cell(r,month_cols[-1]).coordinate})")
+    ws.cell(total_row, merchant_col, "Total")
+    first_data_row, last_data_row = header_row + 1, total_row - 1
+    if last_data_row >= first_data_row:
+        for c in month_cols:
+            letter = excel_col_letter(c)
+            ws.cell(total_row, c, f"=SUM({letter}{first_data_row}:{letter}{last_data_row})")
+        ws.cell(total_row, total_col,
+                f"=SUM({ws.cell(total_row,month_cols[0]).coordinate}:{ws.cell(total_row,month_cols[-1]).coordinate})")
+
+
+def append_rows_to_selected_sheet(xlsx_path: Path, sheet_name: str, rows,
+                                  selected_month_index: int, account_type: str,
+                                  bank_name: str = DEFAULT_BANK_NAME):
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"找不到 Excel 文件：{xlsx_path}")
+    wb = load_workbook(xlsx_path, data_only=False)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Excel 中找不到工作表：{sheet_name}")
+        ws = wb[sheet_name]
+        if str(account_type).strip().lower() == "credit":
+            update_credit_sheet_in_place(ws, rows, selected_month_index, bank_name)
+        elif str(account_type).strip().lower() == "debit":
+            update_debit_sheet_in_place(ws, rows, selected_month_index)
+        else:
+            raise ValueError("Account Type 必须是 Credit 或 Debit。")
+        wb.save(xlsx_path)
+    finally:
+        wb.close()
 
 # ================= 输出路径 =================
 
 def get_summary_output_path(base_path_str: str) -> Path:
+    """Return the exact selected .xlsx path, or the default file in a folder."""
     raw = (base_path_str or "").strip()
 
     if raw:
-        p = Path(raw)
+        p = Path(raw).expanduser()
         if p.suffix.lower() == ".xlsx":
-            folder = p.parent
-        else:
-            folder = p
+            p.parent.mkdir(parents=True, exist_ok=True)
+            return p
+        folder = p
     else:
         folder = script_dir()
 
@@ -1871,11 +2269,11 @@ def mk_button(parent, text, cmd):
 
 def run_parser_ui():
     root = tk.Tk()
-    root.title("BSDP")
+    root.title("BSDP - Multi-Sheet Direct Copy v4")
     root.geometry("1120x950")
     root.configure(bg=BG)
 
-    mk_label(root, "BSDP", font=("Helvetica", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
+    mk_label(root, "BSDP - Multi-Sheet Direct Copy v4", font=("Helvetica", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
 
     default_monthly_summary = script_dir() / "credit_monthly_summary.xlsx"
 
@@ -1886,6 +2284,8 @@ def run_parser_ui():
     month_var = tk.StringVar(value=initial_month_labels[0])
     account_type_var = tk.StringVar(value="Credit")
     bank_name_var = tk.StringVar(value=DEFAULT_BANK_NAME)
+    sheet_var = tk.StringVar(value="")
+    sheet_names: List[str] = []
 
     filebar = tk.Frame(root, bg=BG)
     filebar.pack(fill="x", padx=16, pady=(2, 8))
@@ -1895,20 +2295,36 @@ def run_parser_ui():
     ent_summary = tk.Entry(filebar, textvariable=summary_var, width=78, bg="#111", fg=FG, insertbackground=FG, relief="flat")
     ent_summary.grid(row=0, column=1, padx=6, sticky="we")
 
+    def refresh_sheet_and_month_options(preferred_sheet: str = ""):
+        path = get_summary_output_path(summary_var.get())
+        names = list_workbook_sheet_names(path)
+        sheet_names[:] = names
+        sheet_box["values"] = sheet_names
+
+        selected = preferred_sheet if preferred_sheet in sheet_names else ""
+        if not selected and sheet_var.get() in sheet_names:
+            selected = sheet_var.get()
+        if not selected and sheet_names:
+            selected = sheet_names[0]
+        sheet_var.set(selected)
+
+        detected = read_month_labels_from_selected_sheet(
+            path, selected, account_type_var.get()
+        ) if selected else list(DEFAULT_UI_MONTH_LABELS)
+        months[:] = detected
+        month_box["values"] = months
+        month_var.set(months[0])
+
     def choose_summary():
-        p = filedialog.asksaveasfilename(
-            title="选择总表保存位置（文件名会自动生成为 credit_monthly_summary.xlsx）",
-            defaultextension=".xlsx",
+        p = filedialog.askopenfilename(
+            title="选择需要继续写入的 Excel（支持多个工作表）",
             filetypes=[("Excel files", "*.xlsx")]
         )
         if p:
             summary_var.set(p)
-            detected = read_month_labels_from_path(get_summary_output_path(p))
-            months[:] = detected
-            month_box["values"] = months
-            month_var.set(months[0])
+            refresh_sheet_and_month_options()
 
-    mk_button(filebar, "更改(Browse)", choose_summary).grid(row=0, column=2)
+    mk_button(filebar, "选择 Excel(Browse)", choose_summary).grid(row=0, column=2)
 
     mk_label(filebar, "预处理删除内容(Preprocess remove text)：").grid(row=1, column=0, sticky="w", pady=(8, 0))
     ent_remove = tk.Entry(
@@ -1997,9 +2413,17 @@ def run_parser_ui():
         status.set(f"已选择月份: {m} | 类型: {t}")
 
     def on_account_type_selected(event=None):
+        refresh_sheet_and_month_options(sheet_var.get())
         m = month_var.get().strip()
         t = account_type_var.get().strip()
-        status.set(f"已选择月份: {m} | 类型: {t}")
+        status.set(f"已选择工作表: {sheet_var.get()} | 日期: {m} | 类型: {t}")
+
+    def on_sheet_selected(event=None):
+        refresh_sheet_and_month_options(sheet_var.get())
+        status.set(
+            f"已选择工作表: {sheet_var.get()} | 日期: {month_var.get()} | "
+            f"类型: {account_type_var.get()}"
+        )
 
     mk_label(
         title_row,
@@ -2009,6 +2433,18 @@ def run_parser_ui():
 
     months = list(initial_month_labels)
 
+    mk_label(title_row, "工作表/Page:").pack(side="left", padx=(10, 2))
+    sheet_box = ttk.Combobox(
+        title_row,
+        textvariable=sheet_var,
+        values=sheet_names,
+        width=18,
+        state="readonly"
+    )
+    sheet_box.pack(side="left", padx=(2, 6))
+    sheet_box.bind("<<ComboboxSelected>>", on_sheet_selected)
+
+    mk_label(title_row, "日期/Month:").pack(side="left", padx=(2, 2))
     month_box = ttk.Combobox(
         title_row,
         textvariable=month_var,
@@ -2032,6 +2468,8 @@ def run_parser_ui():
     account_type_box.set("Credit")
     account_type_var.set("Credit")
     account_type_box.bind("<<ComboboxSelected>>", on_account_type_selected)
+
+    refresh_sheet_and_month_options()
 
     mk_button(title_row, "清空文本框", clear_textbox).pack(side="right", padx=(10, 0))
 
@@ -2068,28 +2506,32 @@ def run_parser_ui():
                 overwrite = messagebox.askyesno(
                     "Monthly Summary 已存在",
                     f"目标文件已经存在：\n{target}\n\n"
-                    "初始化会重新建立 Credit Summary 和 debit summary，"
-                    "并清空已有月份金额。所有公式会重新生成。\n\n是否继续？"
+                    "程序会完整复制源文件的全部工作表，并保留名称和顺序。"
+                    "可识别页面中的旧月份金额会被清空。\n\n是否继续？"
                 )
                 if not overwrite:
                     return
 
             status.set("正在导入已有报表模板...")
-            income_count, expense_count, imported_month_labels = import_existing_report_template(
+            income_count, expense_count, imported_month_labels, imported_sheet_names = import_existing_report_template(
                 Path(source),
                 target,
                 bank_name=bank_name_var.get().strip() or DEFAULT_BANK_NAME,
             )
-            months[:] = normalize_month_labels(imported_month_labels)
-            month_box["values"] = months
-            month_var.set(months[0])
-            status.set(f"模板导入完成：{target.name} | UI 日期已匹配 Excel")
+            summary_var.set(str(target))
+            refresh_sheet_and_month_options(imported_sheet_names[0] if imported_sheet_names else "")
+            status.set(
+                f"模板导入完成：{target.name} | 共 {len(imported_sheet_names)} 个工作表 | "
+                f"当前: {sheet_var.get()}"
+            )
             messagebox.showinfo(
                 "导入完成",
                 f"Monthly Summary 已建立：\n{target}\n\n"
-                f"Income 项目：{income_count}\n"
-                f"Expense Merchant：{expense_count}\n\n"
-                "历史金额没有导入；所有月份金额为空，公式已正常建立。\n"
+                f"导入工作表：{len(imported_sheet_names)} 个\n"
+                f"工作表名称：{', '.join(imported_sheet_names)}\n"
+                f"Credit 项目：{income_count}\n"
+                f"Debit Merchant：{expense_count}\n\n"
+                "全部工作表名称已保留；可识别的历史金额已清空，公式与格式已保留。\n"
                 f"UI 日期顺序：{', '.join(months)}"
             )
         except Exception as e:
@@ -2110,7 +2552,12 @@ def run_parser_ui():
             if selected_month_display not in months:
                 messagebox.showerror("错误", "请选择有效日期/月份")
                 return
-            selected_month = CREDIT_MONTHS[months.index(selected_month_display)]
+            selected_month_index = months.index(selected_month_display)
+
+            selected_sheet = sheet_var.get().strip()
+            if not selected_sheet:
+                messagebox.showerror("错误", "请选择要修改的工作表/Page")
+                return
 
             selected_account_type = account_type_var.get().strip().lower()
             if selected_account_type not in ("credit", "debit"):
@@ -2132,22 +2579,18 @@ def run_parser_ui():
 
             summary_xlsx = get_summary_output_path(summary_var.get())
 
-            if selected_account_type == "credit":
-                write_or_update_credit_summary_xlsx(
-                    summary_xlsx,
-                    rows,
-                    selected_month,
-                    bank_name=bank_name
-                )
-            else:
-                write_or_update_debit_summary_sheet(
-                    summary_xlsx,
-                    rows,
-                    selected_month
-                )
+            append_rows_to_selected_sheet(
+                summary_xlsx,
+                selected_sheet,
+                rows,
+                selected_month_index,
+                selected_account_type,
+                bank_name=bank_name,
+            )
 
             status.set(
-                f"已完成 / Completed | 日期: {selected_month_display} | 类型: {selected_account_type.title()} | 总表: {summary_xlsx.name}"
+                f"已完成 / Completed | 工作表: {selected_sheet} | 日期: {selected_month_display} | "
+                f"类型: {selected_account_type.title()} | 总表: {summary_xlsx.name}"
             )
             date_format_display = (
                 resolved_date_format
@@ -2158,8 +2601,10 @@ def run_parser_ui():
             messagebox.showinfo(
                 "Completed",
                 f"提取成功: {len(rows)} 笔交易\n"
+                f"当前工作表: {selected_sheet}\n"
                 f"当前日期: {selected_month_display}\n"
                 f"当前类型: {selected_account_type.title()}\n"
+                "写入方式: 保留原有数据并继续追加\n"
                 f"日期格式: {date_format_display}\n"
                 f"总表文件: {summary_xlsx.name}\n"
                 f"分类规则文件: {category_rules_path()}\n"
@@ -2174,7 +2619,7 @@ def run_parser_ui():
 
     btns = tk.Frame(root, bg=BG)
     btns.pack(pady=12)
-    mk_button(btns, "导入已有报表模板", import_existing_report).grid(row=0, column=0, padx=8)
+    mk_button(btns, "导入整本 Excel（全部 Sheet）", import_existing_report).grid(row=0, column=0, padx=8)
     mk_button(btns, "Start", start).grid(row=0, column=1, padx=8)
     mk_button(btns, "Stop", stop).grid(row=0, column=2, padx=8)
 
