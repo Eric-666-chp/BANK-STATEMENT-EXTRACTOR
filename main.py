@@ -2376,10 +2376,15 @@ def mk_button(parent, text, cmd):
 def run_parser_ui():
     root = tk.Tk()
     root.title("BSDP - Bank Statement Data Processing")
-    root.geometry("1120x950")
+    root.geometry("1280x900")
+    root.minsize(1080, 760)
     root.configure(bg=BG)
 
-    mk_label(root, "BSDP - Bank Statement Data Processing", font=("Helvetica", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
+    mk_label(
+        root,
+        "BSDP - Bank Statement Data Processing",
+        font=("Helvetica", 17, "bold")
+    ).pack(anchor="w", padx=14, pady=(12, 10))
 
     default_monthly_summary = script_dir() / "credit_monthly_summary.xlsx"
 
@@ -2391,15 +2396,121 @@ def run_parser_ui():
     account_type_var = tk.StringVar(value="Credit")
     bank_name_var = tk.StringVar(value=DEFAULT_BANK_NAME)
     sheet_var = tk.StringVar(value="")
-    sheet_names: List[str] = []
+    status = tk.StringVar(value="尚未开始(Not started)")
 
+    sheet_names: List[str] = []
+    months = list(initial_month_labels)
+
+    # ---------- 顶部文件和解析设置 ----------
     filebar = tk.Frame(root, bg=BG)
-    filebar.pack(fill="x", padx=16, pady=(2, 8))
+    filebar.pack(fill="x", padx=14, pady=(0, 8))
     filebar.columnconfigure(1, weight=1)
 
-    mk_label(filebar, "月份总表 Excel 保存位置(Monthly summary location)：").grid(row=0, column=0, sticky="w")
-    ent_summary = tk.Entry(filebar, textvariable=summary_var, width=78, bg="#111", fg=FG, insertbackground=FG, relief="flat")
-    ent_summary.grid(row=0, column=1, padx=6, sticky="we")
+    mk_label(filebar, "月份总表 Excel 保存位置(Monthly summary location)：").grid(
+        row=0, column=0, sticky="w", pady=3
+    )
+    ent_summary = tk.Entry(
+        filebar, textvariable=summary_var, bg="#111", fg=FG,
+        insertbackground=FG, relief="flat"
+    )
+    ent_summary.grid(row=0, column=1, padx=(8, 8), sticky="we", pady=3)
+
+    mk_label(filebar, "预处理删除内容(Preprocess remove text)：").grid(
+        row=1, column=0, sticky="w", pady=3
+    )
+    ent_remove = tk.Entry(
+        filebar, textvariable=remove_var, bg="#111", fg=FG,
+        insertbackground=FG, relief="flat"
+    )
+    ent_remove.grid(row=1, column=1, padx=(8, 8), sticky="we", pady=3)
+    mk_label(
+        filebar,
+        "例如: target, Mcdonald || 不同的关键字请使用逗号隔开",
+        fg="#9cdcfe"
+    ).grid(row=2, column=1, sticky="w", padx=8, pady=(0, 5))
+
+    mk_label(filebar, "日期示例或格式(Date example / format)：").grid(
+        row=3, column=0, sticky="w", pady=3
+    )
+    ent_date_format = tk.Entry(
+        filebar, textvariable=date_format_var, bg="#111", fg=FG,
+        insertbackground=FG, relief="flat"
+    )
+    ent_date_format.grid(row=3, column=1, padx=(8, 8), sticky="we", pady=3)
+    mk_label(
+        filebar,
+        "直接输入账单里的日期示例，程序会自动转换格式：\n"
+        "4-22 → M-DD    May 17 → M DD    17 May → DD M    2025-4-22 → YYYY-M-DD",
+        fg="#9cdcfe", justify="left", anchor="w"
+    ).grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 7))
+
+    mk_label(filebar, "Bank Name（仅 Credit 表第一行使用）：").grid(
+        row=5, column=0, sticky="w", pady=3
+    )
+    ent_bank = tk.Entry(
+        filebar, textvariable=bank_name_var, bg="#111", fg=FG,
+        insertbackground=FG, relief="flat"
+    )
+    ent_bank.grid(row=5, column=1, padx=(8, 8), sticky="we", pady=3)
+
+    # ---------- 文本框及工作表/日期选择 ----------
+    body = tk.Frame(root, bg=BG)
+    body.pack(fill="both", expand=True, padx=10, pady=(4, 4))
+
+    control_row = tk.Frame(body, bg=BG)
+    control_row.pack(fill="x", pady=(0, 6))
+
+    mk_label(control_row, "Excel sheet:", font=("Helvetica", 12, "bold")).pack(
+        side="left", padx=(0, 5)
+    )
+    sheet_box = ttk.Combobox(
+        control_row, textvariable=sheet_var, values=sheet_names,
+        width=22, state="readonly"
+    )
+    sheet_box.pack(side="left", padx=(0, 14))
+
+    mk_label(control_row, "Month:", font=("Helvetica", 12, "bold")).pack(
+        side="left", padx=(0, 5)
+    )
+    month_box = ttk.Combobox(
+        control_row, textvariable=month_var, values=months,
+        width=12, state="readonly"
+    )
+    month_box.pack(side="left", padx=(0, 14))
+
+    account_type_box = ttk.Combobox(
+        control_row, textvariable=account_type_var,
+        values=["Credit", "Debit"], width=11, state="readonly"
+    )
+    account_type_box.pack(side="left", padx=(0, 14))
+
+    mk_label(
+        control_row,
+        "在下方文本框输入账单(Please paste your bank statement data below.)",
+        fg="#9cdcfe"
+    ).pack(side="left", padx=(4, 10))
+
+    txt_frame = tk.Frame(body, bg=BG)
+    txt_frame.pack(fill="both", expand=True)
+
+    txt_input = tk.Text(
+        txt_frame, wrap="word", bg="#111", fg=FG,
+        insertbackground=FG, relief="flat", undo=True
+    )
+    txt_input.pack(side="left", fill="both", expand=True)
+
+    sb = tk.Scrollbar(txt_frame, command=txt_input.yview)
+    sb.pack(side="right", fill="y")
+    txt_input.configure(yscrollcommand=sb.set)
+
+    def clear_textbox():
+        txt_input.delete("1.0", tk.END)
+        txt_input.edit_reset()
+        txt_input.focus_set()
+        status.set("文本框已清空 (Text box cleared)")
+
+    clear_btn = mk_button(control_row, "清空文本框", clear_textbox)
+    clear_btn.pack(side="right", padx=(10, 0))
 
     def refresh_sheet_and_month_options(preferred_sheet: str = ""):
         path = get_summary_output_path(summary_var.get())
@@ -2414,12 +2525,13 @@ def run_parser_ui():
             selected = sheet_names[0]
         sheet_var.set(selected)
 
-        detected = read_month_labels_from_selected_sheet(
-            path, selected, account_type_var.get()
-        ) if selected else list(DEFAULT_UI_MONTH_LABELS)
+        detected = (
+            read_month_labels_from_selected_sheet(path, selected, account_type_var.get())
+            if selected else list(DEFAULT_UI_MONTH_LABELS)
+        )
         months[:] = detected
         month_box["values"] = months
-        month_var.set(months[0])
+        month_var.set(months[0] if months else "")
 
     def choose_summary():
         p = filedialog.askopenfilename(
@@ -2429,164 +2541,30 @@ def run_parser_ui():
         if p:
             summary_var.set(p)
             refresh_sheet_and_month_options()
+            status.set(f"已选择 Excel: {Path(p).name}")
 
-    mk_button(filebar, "选择 Excel(Browse)", choose_summary).grid(row=0, column=2)
-
-    mk_label(filebar, "预处理删除内容(Preprocess remove text)：").grid(row=1, column=0, sticky="w", pady=(8, 0))
-    ent_remove = tk.Entry(
-        filebar,
-        textvariable=remove_var,
-        width=78,
-        bg="#111",
-        fg=FG,
-        insertbackground=FG,
-        relief="flat"
-    )
-    ent_remove.grid(row=1, column=1, padx=6, pady=(8, 0), sticky="we")
-
-    mk_label(
-        filebar,
-        "例如: target, Mcdonald || 不同的关键字请使用逗号隔开",
-        fg="#9cdcfe"
-    ).grid(row=2, column=1, sticky="w", padx=6, pady=(4, 0))
-
-    mk_label(filebar, "日期示例或格式(Date example / format)：").grid(row=3, column=0, sticky="w", pady=(8, 0))
-    ent_date_format = tk.Entry(
-        filebar,
-        textvariable=date_format_var,
-        width=78,
-        bg="#111",
-        fg=FG,
-        insertbackground=FG,
-        relief="flat"
-    )
-    ent_date_format.grid(row=3, column=1, padx=6, pady=(8, 0), sticky="we")
-
-    date_help = (
-        "直接输入账单里的日期示例，程序会自动转换格式：\n"
-        "4-22 → M-DD    May 17 → M DD    17 May → DD M    "
-        "2025-4-22 → YYYY-M-DD\n"
-    )
-    mk_label(
-        filebar,
-        date_help,
-        fg="#9cdcfe",
-        justify="left",
-        anchor="w"
-    ).grid(row=4, column=1, columnspan=2, sticky="w", padx=6, pady=(4, 0))
-
-    mk_label(filebar, "Bank Name（仅 Credit 表第一行使用）：").grid(row=5, column=0, sticky="w", pady=(8, 0))
-    ent_bank = tk.Entry(
-        filebar,
-        textvariable=bank_name_var,
-        width=78,
-        bg="#111",
-        fg=FG,
-        insertbackground=FG,
-        relief="flat"
-    )
-    ent_bank.grid(row=5, column=1, padx=6, pady=(8, 0), sticky="we")
-
-    center = tk.Frame(root, bg=BG)
-    center.pack(fill="both", expand=True, padx=16, pady=(6, 6))
-
-    title_row = tk.Frame(center, bg=BG)
-    title_row.pack(fill="x", pady=(0, 6))
-
-    txt_frame = tk.Frame(center, bg=BG)
-    txt_frame.pack(fill="both", expand=True)
-
-    txt_input = tk.Text(
-        txt_frame,
-        wrap="word",
-        bg="#111",
-        fg=FG,
-        insertbackground=FG,
-        relief="flat",
-        undo=True
-    )
-
-    status = tk.StringVar(value="尚未开始(Not started)")
-
-    def clear_textbox():
-        txt_input.delete("1.0", tk.END)
-        txt_input.focus_set()
-        status.set("文本框已清空 (Text box cleared)")
+    browse_btn = mk_button(filebar, "选择 Excel(Browse)", choose_summary)
+    browse_btn.grid(row=0, column=2, sticky="e", pady=3)
 
     def on_month_selected(event=None):
-        m = month_var.get().strip()
-        t = account_type_var.get().strip()
-        status.set(f"已选择月份: {m} | 类型: {t}")
-
-    def on_account_type_selected(event=None):
-        refresh_sheet_and_month_options(sheet_var.get())
-        m = month_var.get().strip()
-        t = account_type_var.get().strip()
-        status.set(f"已选择工作表: {sheet_var.get()} | 日期: {m} | 类型: {t}")
-
-    def on_sheet_selected(event=None):
-        refresh_sheet_and_month_options(sheet_var.get())
         status.set(
             f"已选择工作表: {sheet_var.get()} | 日期: {month_var.get()} | "
             f"类型: {account_type_var.get()}"
         )
 
-    mk_label(
-        title_row,
-        "在下方文本框输入账单(Please paste your bank statement data into the text box below.)：",
-        font=("Helvetica", 12)
-    ).pack(side="left", anchor="w")
+    def on_account_type_selected(event=None):
+        refresh_sheet_and_month_options(sheet_var.get())
+        on_month_selected()
 
-    months = list(initial_month_labels)
+    def on_sheet_selected(event=None):
+        refresh_sheet_and_month_options(sheet_var.get())
+        on_month_selected()
 
-    mk_label(title_row, "工作表/Page:").pack(side="left", padx=(10, 2))
-    sheet_box = ttk.Combobox(
-        title_row,
-        textvariable=sheet_var,
-        values=sheet_names,
-        width=18,
-        state="readonly"
-    )
-    sheet_box.pack(side="left", padx=(2, 6))
     sheet_box.bind("<<ComboboxSelected>>", on_sheet_selected)
-
-    mk_label(title_row, "日期/Month:").pack(side="left", padx=(2, 2))
-    month_box = ttk.Combobox(
-        title_row,
-        textvariable=month_var,
-        values=months,
-        width=8,
-        state="readonly"
-    )
-    month_box.pack(side="left", padx=(10, 6))
-    month_box.set(months[0])
-    month_var.set(months[0])
     month_box.bind("<<ComboboxSelected>>", on_month_selected)
-
-    account_type_box = ttk.Combobox(
-        title_row,
-        textvariable=account_type_var,
-        values=["Credit", "Debit"],
-        width=10,
-        state="readonly"
-    )
-    account_type_box.pack(side="left", padx=(6, 6))
-    account_type_box.set("Credit")
-    account_type_var.set("Credit")
     account_type_box.bind("<<ComboboxSelected>>", on_account_type_selected)
 
     refresh_sheet_and_month_options()
-
-    mk_button(title_row, "清空文本框", clear_textbox).pack(side="right", padx=(10, 0))
-
-    txt_input.pack(side="left", fill="both", expand=True)
-
-    sb = tk.Scrollbar(txt_frame, command=txt_input.yview)
-    sb.pack(side="right", fill="y")
-    txt_input.configure(yscrollcommand=sb.set)
-
-    mk_label(root, "状态(Status)：").pack(anchor="w", padx=16)
-    mk_label(root, "", fg="#9cdcfe", textvariable=status).pack(anchor="w", padx=16)
 
     def keep_cursor_visible(event=None):
         txt_input.see("insert")
@@ -2597,6 +2575,12 @@ def run_parser_ui():
     txt_input.bind("<MouseWheel>", keep_cursor_visible)
     txt_input.bind("<Return>", keep_cursor_visible)
     txt_input.bind("<<Paste>>", keep_cursor_visible)
+
+    # ---------- 状态 ----------
+    status_frame = tk.Frame(root, bg=BG)
+    status_frame.pack(fill="x", padx=12, pady=(5, 2))
+    mk_label(status_frame, "状态(Status)：").pack(anchor="w")
+    mk_label(status_frame, "", fg="#9cdcfe", textvariable=status).pack(anchor="w")
 
     def import_existing_report(clear_existing_data: bool):
         mode_name = "清空旧金额（模板模式）" if clear_existing_data else "保留全部原有数据"
@@ -2621,8 +2605,7 @@ def run_parser_ui():
                 overwrite = messagebox.askyesno(
                     "目标 Excel 已存在",
                     f"目标文件已经存在：\n{target}\n\n"
-                    f"导入模式：{mode_name}\n"
-                    f"{action_text}\n\n"
+                    f"导入模式：{mode_name}\n{action_text}\n\n"
                     "目标文件将被这次导入结果覆盖，是否继续？"
                 )
                 if not overwrite:
@@ -2637,8 +2620,7 @@ def run_parser_ui():
 
             status.set(f"正在导入已有报表：{mode_name}...")
             income_count, expense_count, imported_month_labels, imported_sheet_names = import_existing_report_template(
-                Path(source),
-                target,
+                Path(source), target,
                 bank_name=bank_name_var.get().strip() or DEFAULT_BANK_NAME,
                 clear_existing_data=clear_existing_data,
             )
@@ -2670,13 +2652,9 @@ def run_parser_ui():
             status.set(f"模板导入失败：{type(e).__name__}: {e}")
             messagebox.showerror("导入失败", f"{type(e).__name__}: {e}")
 
-
-
     def start():
         try:
-            # 直接处理文本框中的内容，不再生成 statement.txt。
             content = txt_input.get("1.0", "end-1c")
-
             custom_date_input = date_format_var.get().strip()
             resolved_date_format = resolve_date_input_to_format(custom_date_input)
             configure_date_format(resolved_date_format)
@@ -2699,25 +2677,19 @@ def run_parser_ui():
 
             bank_name = bank_name_var.get().strip() or DEFAULT_BANK_NAME
             remove_items = parse_remove_items(remove_var.get())
+            status.set(
+                f"正在处理... 工作表: {selected_sheet} | 日期: {selected_month_display} | "
+                f"类型: {selected_account_type.title()}"
+            )
 
-            status.set(f"正在处理... 日期: {selected_month_display} | 类型: {selected_account_type.title()}")
-
-            # 全部在内存中完成预处理和解析，不再生成以下中间文件：
-            # statement.txt、parsed_transactions.csv、parsed_transactions.txt、
-            # parsed_transactions.xlsx。
             preprocessed_text = preprocess_statement_text(content, remove_items)
-
             hits = parse_auto(preprocessed_text)
             rows = [(h.merchant, h.amount, h.who) for h in hits]
-
             summary_xlsx = get_summary_output_path(summary_var.get())
 
             append_rows_to_selected_sheet(
-                summary_xlsx,
-                selected_sheet,
-                rows,
-                selected_month_index,
-                selected_account_type,
+                summary_xlsx, selected_sheet, rows,
+                selected_month_index, selected_account_type,
                 bank_name=bank_name,
             )
 
@@ -2726,11 +2698,9 @@ def run_parser_ui():
                 f"类型: {selected_account_type.title()} | 总表: {summary_xlsx.name}"
             )
             date_format_display = (
-                resolved_date_format
-                if resolved_date_format
+                resolved_date_format if resolved_date_format
                 else "默认格式 MM/DD、MM/DD/YY、MM/DD/YYYY"
             )
-
             messagebox.showinfo(
                 "Completed",
                 f"提取成功: {len(rows)} 笔交易\n"
@@ -2742,7 +2712,6 @@ def run_parser_ui():
                 f"总表文件: {summary_xlsx.name}\n"
                 f"分类规则文件: {category_rules_path()}\n"
             )
-
         except Exception as e:
             messagebox.showerror("异常 / Error", f"{type(e).__name__}: {e}")
             status.set(f"解析失败 / Failed: {type(e).__name__}: {e}")
@@ -2750,20 +2719,26 @@ def run_parser_ui():
     def stop():
         root.destroy()
 
-    btns = tk.Frame(root, bg=BG)
-    btns.pack(pady=12)
-    mk_button(
-        btns,
-        "导入并清空旧金额",
-        lambda: import_existing_report(True)
-    ).grid(row=0, column=0, padx=8)
-    mk_button(
-        btns,
-        "导入并保留全部数据",
-        lambda: import_existing_report(False)
-    ).grid(row=0, column=1, padx=8)
-    mk_button(btns, "Start", start).grid(row=0, column=2, padx=8)
-    mk_button(btns, "Stop", stop).grid(row=0, column=3, padx=8)
+    # ---------- 底部按钮：导入在左，Start/Stop 居中 ----------
+    footer = tk.Frame(root, bg=BG)
+    footer.pack(fill="x", padx=10, pady=(6, 12))
+    footer.columnconfigure(0, weight=1)
+    footer.columnconfigure(1, weight=1)
+    footer.columnconfigure(2, weight=1)
+
+    import_buttons = tk.Frame(footer, bg=BG)
+    import_buttons.grid(row=0, column=0, sticky="w")
+    mk_button(import_buttons, "导入并清空旧金额", lambda: import_existing_report(True)).pack(
+        side="left", padx=(0, 8)
+    )
+    mk_button(import_buttons, "导入并保留全部数据", lambda: import_existing_report(False)).pack(
+        side="left", padx=(0, 8)
+    )
+
+    run_buttons = tk.Frame(footer, bg=BG)
+    run_buttons.grid(row=0, column=1)
+    mk_button(run_buttons, "Start", start).pack(side="left", padx=6)
+    mk_button(run_buttons, "Stop", stop).pack(side="left", padx=6)
 
     root.mainloop()
 
