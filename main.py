@@ -1547,8 +1547,59 @@ def display_cell_text(cell) -> str:
     return normalized_cell_text(value)
 
 
+
+
+def looks_like_period_header(cell) -> bool:
+    """Return True when a header cell looks like a month/date/period label.
+
+    This includes normal month names (AUG), date-like labels (31-Jul, 6-Aug,
+    08/06/2026), and real Excel date cells. It allows valid period columns
+    to appear after Total/Category instead of requiring one contiguous block.
+    """
+    value = cell.value
+    if value is None:
+        return False
+    try:
+        if getattr(cell, "is_date", False):
+            return True
+    except Exception:
+        pass
+
+    text = display_cell_text(cell).strip()
+    if not text:
+        return False
+    key = text.upper().replace(".", "")
+    if key in {
+        "JAN", "JANUARY", "FEB", "FEBRUARY", "MAR", "MARCH",
+        "APR", "APRIL", "MAY", "JUN", "JUNE", "JUL", "JULY",
+        "AUG", "AUGUST", "SEP", "SEPT", "SEPTEMBER",
+        "OCT", "OCTOBER", "NOV", "NOVEMBER", "DEC", "DECEMBER"
+    }:
+        return True
+
+    month_word = r"(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)"
+    patterns = [
+        rf"^\d{{1,2}}[-/\s]{month_word}(?:[-/\s]\d{{2,4}})?$",
+        rf"^{month_word}[-/\s]\d{{1,2}}(?:[-/\s]\d{{2,4}})?$",
+        r"^\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?$",
+        r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}$",
+    ]
+    return any(re.fullmatch(p, text, re.IGNORECASE) for p in patterns)
+
+
+def build_sum_formula_for_columns(ws, row: int, columns: List[int]) -> str:
+    """Build a SUM formula for possibly non-contiguous period columns."""
+    refs = [ws.cell(row=row, column=c).coordinate for c in columns]
+    return f"=SUM({','.join(refs)})" if refs else ""
+
+
 def extract_month_labels_from_sheet(ws) -> List[str]:
-    """Read 12 horizontal period/date headers from a Merchant-style sheet."""
+    """Read every horizontal period/date header from a Merchant-style sheet.
+
+    Period columns are all columns between Merchant and Total (or Category).
+    This intentionally supports more than 12 periods, for example an extra
+    ``31-Jul`` column after the normal monthly columns.
+    """
     header_row = find_header_row(ws, ["Merchant"])
     if header_row is None:
         return []
@@ -1558,29 +1609,47 @@ def extract_month_labels_from_sheet(ws) -> List[str]:
 
     total_col = find_column_by_header(ws, header_row, ["Total", "Amount Total", "Grand Total"])
     category_col = find_column_by_header(ws, header_row, ["Category", "Class"])
-    end_col = total_col or category_col or (merchant_col + 13)
-    candidates = []
-    for col in range(merchant_col + 1, min(end_col, ws.max_column + 1)):
-        text = display_cell_text(ws.cell(row=header_row, column=col))
-        if text:
-            candidates.append(text)
-        if len(candidates) == 12:
+
+    candidates: List[str] = []
+    for col in range(merchant_col + 1, ws.max_column + 1):
+        if col in {total_col, category_col}:
+            continue
+        cell = ws.cell(row=header_row, column=col)
+        # Columns before Total remain compatible with the original layout.
+        # Columns after Category/Total are included only when they look like dates.
+        if (total_col is not None and col < total_col) or looks_like_period_header(cell):
+            text = display_cell_text(cell)
+            if text:
+                candidates.append(text)
+    return candidates
+
+
+def find_credit_period_rows(ws, header_row: int, begin_col: int) -> Tuple[List[int], Optional[int]]:
+    """Return all labeled period rows and the TOTAL row for a Credit layout."""
+    if begin_col <= 1:
+        return [], None
+
+    label_col = begin_col - 1
+    period_rows: List[int] = []
+    total_row: Optional[int] = None
+
+    for row in range(header_row + 1, ws.max_row + 1):
+        label = display_cell_text(ws.cell(row=row, column=label_col)).strip()
+        key = label.upper()
+        if key in {"TOTAL", "GRAND TOTAL"}:
+            total_row = row
             break
-    return candidates if len(candidates) == 12 else []
+        if label:
+            period_rows.append(row)
+
+    # Some templates may not already contain a TOTAL row.
+    if total_row is None and period_rows:
+        total_row = period_rows[-1] + 1
+    return period_rows, total_row
 
 
 def extract_month_labels_from_income_sheet(ws) -> List[str]:
-    """Read the 12 date/period labels from the Income/Credit page.
-
-    Supported Income layouts:
-      1. Credit Summary layout: labels are vertically stored beside the
-         BEGIN BALANCE row, normally A3:A14.
-      2. Merchant layout: labels are horizontally stored in the header row.
-
-    The Income page is the authoritative source for UI labels.
-    """
-    # Credit Summary layout: locate the row containing BEGIN BALANCE and use
-    # the column immediately to its left as the period-label column.
+    """Read every date/period label from an Income/Credit page."""
     limit = min(ws.max_row, 100)
     begin_row = None
     begin_col = None
@@ -1593,18 +1662,11 @@ def extract_month_labels_from_income_sheet(ws) -> List[str]:
             break
 
     if begin_row is not None and begin_col is not None and begin_col > 1:
-        label_col = begin_col - 1
-        candidates = []
-        for row in range(begin_row + 1, begin_row + 13):
-            text = display_cell_text(ws.cell(row=row, column=label_col))
-            if text:
-                candidates.append(text)
-            else:
-                candidates.append("")
-        if len(candidates) == 12 and any(candidates):
-            return normalize_month_labels(candidates)
+        period_rows, _ = find_credit_period_rows(ws, begin_row, begin_col)
+        labels = [display_cell_text(ws.cell(row=r, column=begin_col - 1)) for r in period_rows]
+        if labels:
+            return labels
 
-    # Fallback for an Income page arranged as Merchant | period1..period12.
     return extract_month_labels_from_sheet(ws)
 
 
@@ -1784,12 +1846,16 @@ def clear_credit_amounts_keep_layout(ws) -> int:
     total_credit_col = header_map[CREDIT_TOTAL_HEADER]
     debit_col = header_map[CREDIT_DEBIT_HEADER]
     ending_col = header_map[CREDIT_ENDING_HEADER]
-    first_data_row = header_row + 1
-    last_data_row = header_row + 12
-    total_row = header_row + 13
+    period_rows, total_row = find_credit_period_rows(ws, header_row, begin_col)
+    if not period_rows:
+        return 0
+    first_data_row = period_rows[0]
+    last_data_row = period_rows[-1]
+    if total_row is None:
+        total_row = last_data_row + 1
 
     dynamic_cols = list(range(begin_col + 1, total_credit_col))
-    for row in range(first_data_row, last_data_row + 1):
+    for row in period_rows:
         for col in dynamic_cols:
             ws.cell(row=row, column=col).value = None
         ws.cell(row=row, column=debit_col).value = None
@@ -1799,9 +1865,9 @@ def clear_credit_amounts_keep_layout(ws) -> int:
         ws.cell(row=first_data_row, column=begin_col, value=0)
         ws.cell(row=first_data_row, column=begin_col).number_format = "0.00"
 
-    for row in range(first_data_row, last_data_row + 1):
-        if row > first_data_row:
-            prev_end = ws.cell(row=row - 1, column=ending_col).coordinate
+    for row_index, row in enumerate(period_rows):
+        if row_index > 0:
+            prev_end = ws.cell(row=period_rows[row_index - 1], column=ending_col).coordinate
             ws.cell(row=row, column=begin_col, value=f"={prev_end}")
         if dynamic_cols:
             start_ref = ws.cell(row=row, column=dynamic_cols[0]).coordinate
@@ -1842,9 +1908,7 @@ def clear_debit_amounts_keep_layout(ws) -> int:
         merchant_count += 1
         for col in month_cols:
             ws.cell(row=row, column=col).value = None
-        start_ref = ws.cell(row=row, column=month_cols[0]).coordinate
-        end_ref = ws.cell(row=row, column=month_cols[-1]).coordinate
-        ws.cell(row=row, column=total_col, value=f"=SUM({start_ref}:{end_ref})")
+        ws.cell(row=row, column=total_col, value=build_sum_formula_for_columns(ws, row, month_cols))
         ws.cell(row=row, column=total_col).number_format = "0.00"
 
     if total_row is None:
@@ -1859,9 +1923,8 @@ def clear_debit_amounts_keep_layout(ws) -> int:
             ws.cell(row=total_row, column=col,
                     value=f"=SUM({letter}{first_data_row}:{letter}{last_data_row})")
             ws.cell(row=total_row, column=col).number_format = "0.00"
-        start_ref = ws.cell(row=total_row, column=month_cols[0]).coordinate
-        end_ref = ws.cell(row=total_row, column=month_cols[-1]).coordinate
-        ws.cell(row=total_row, column=total_col, value=f"=SUM({start_ref}:{end_ref})")
+        ws.cell(row=total_row, column=total_col,
+                value=build_sum_formula_for_columns(ws, total_row, month_cols))
         ws.cell(row=total_row, column=total_col).number_format = "0.00"
     return merchant_count
 
@@ -1870,12 +1933,15 @@ def import_existing_report_template(
     source_path: Path,
     target_path: Path,
     bank_name: str = DEFAULT_BANK_NAME,
+    clear_existing_data: bool = True,
 ):
     """完整复制源工作簿的所有工作表，并保留原始名称和顺序。
 
-    这个版本不会重新创建 Credit Summary / debit summary，也不会只提取
-    前两个工作表。它先把整个源 .xlsx 文件复制到临时文件，再验证源文件
-    与复制文件的 sheetnames 完全一致，最后才清理可识别页面中的旧金额。
+    clear_existing_data=True：模板模式，清空可识别 Credit/Debit 页面中的旧月份金额，
+    但保留工作表名称、顺序、格式、公式框架、Merchant 与 Category。
+
+    clear_existing_data=False：完整保留模式，源 Excel 中所有原有数据、公式、格式、
+    工作表名称和顺序均保持不变，之后可在 UI 中继续追加新数据。
     """
     import shutil
     import tempfile
@@ -1935,22 +2001,38 @@ def import_existing_report_template(
             debit_merchant_count = 0
             month_labels: List[str] = []
 
-            # 注意：这里只修改工作表内容，绝不 remove/create/rename worksheet。
+            # 注意：这里只读取/修改工作表内容，绝不 remove/create/rename worksheet。
             for ws in list(wb.worksheets):
                 if not month_labels:
                     labels = extract_month_labels_from_income_sheet(ws)
                     if not labels:
                         labels = extract_month_labels_from_sheet(ws)
                     if labels:
-                        month_labels = normalize_month_labels(labels)
+                        month_labels = list(labels)
 
                 header_row, _ = find_credit_layout(ws)
                 if header_row is not None:
-                    credit_item_count += clear_credit_amounts_keep_layout(ws)
+                    if clear_existing_data:
+                        credit_item_count += clear_credit_amounts_keep_layout(ws)
+                    else:
+                        # 完整保留模式只统计可识别的 Credit 项目，不改变任何单元格。
+                        layout = find_credit_layout(ws)
+                        if layout[0] is not None:
+                            credit_item_count += max(0, len(layout[1]))
                     continue
 
-                if find_debit_layout(ws) is not None:
-                    debit_merchant_count += clear_debit_amounts_keep_layout(ws)
+                debit_layout = find_debit_layout(ws)
+                if debit_layout is not None:
+                    if clear_existing_data:
+                        debit_merchant_count += clear_debit_amounts_keep_layout(ws)
+                    else:
+                        # 完整保留模式只统计 Merchant，不改变任何单元格。
+                        header_row_d, merchant_col, _, _, _ = debit_layout
+                        for row in range(header_row_d + 1, ws.max_row + 1):
+                            merchant = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+                            if not merchant or merchant.upper() in {"TOTAL", "GRAND TOTAL"}:
+                                continue
+                            debit_merchant_count += 1
 
             # 保存前再次确认代码没有意外删除、增加或改名。
             before_save_names = list(wb.sheetnames)
@@ -1983,7 +2065,7 @@ def import_existing_report_template(
         return (
             credit_item_count,
             debit_merchant_count,
-            normalize_month_labels(month_labels),
+            (month_labels if month_labels else list(DEFAULT_UI_MONTH_LABELS)),
             final_sheet_names,
         )
     finally:
@@ -2020,7 +2102,7 @@ def read_month_labels_from_selected_sheet(path: Path, sheet_name: str, account_t
             labels = extract_month_labels_from_income_sheet(ws)
         else:
             labels = extract_month_labels_from_sheet(ws)
-        return normalize_month_labels(labels) if labels else list(DEFAULT_UI_MONTH_LABELS)
+        return labels if labels else list(DEFAULT_UI_MONTH_LABELS)
     finally:
         wb.close()
 
@@ -2094,8 +2176,15 @@ def find_debit_layout(ws):
     category_col = find_column_by_header(ws, header_row, ["Category", "Class"])
     if merchant_col is None or total_col is None:
         return None
-    month_cols = list(range(merchant_col + 1, merchant_col + 13))
-    if month_cols[-1] >= total_col:
+    # Standard period columns are between Merchant and Total. In addition,
+    # date-like headers anywhere after Total/Category are also writable periods.
+    month_cols = list(range(merchant_col + 1, total_col))
+    for col in range(total_col + 1, ws.max_column + 1):
+        if col == category_col:
+            continue
+        if looks_like_period_header(ws.cell(row=header_row, column=col)):
+            month_cols.append(col)
+    if not month_cols:
         return None
     return header_row, merchant_col, month_cols, total_col, category_col
 
@@ -2105,9 +2194,13 @@ def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name:
     if header_row is None:
         raise ValueError(f"工作表“{ws.title}”不是可识别的 Credit 格式。")
     begin_col = header_map[CREDIT_BEGIN_HEADER]
-    month_row = header_row + 1 + selected_month_index
-    if month_row > ws.max_row:
-        raise ValueError(f"工作表“{ws.title}”没有完整的 12 个日期/月份行。")
+    period_rows, total_row = find_credit_period_rows(ws, header_row, begin_col)
+    if selected_month_index < 0 or selected_month_index >= len(period_rows):
+        raise ValueError(
+            f"工作表“{ws.title}”只有 {len(period_rows)} 个可写入日期/期间，"
+            f"无法写入第 {selected_month_index + 1} 个。"
+        )
+    month_row = period_rows[selected_month_index]
     if begin_col > 1:
         bank_cell = ws.cell(row=max(1, header_row - 1), column=begin_col)
         if bank_cell.value is None or str(bank_cell.value).strip() == "":
@@ -2126,9 +2219,9 @@ def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name:
             current_total_col = current_map[CREDIT_TOTAL_HEADER]
             ws.insert_cols(current_total_col, 1)
             copy_column_style(ws, max(begin_col + 1, current_total_col - 1), current_total_col,
-                              max(ws.max_row, header_row + 13))
+                              max(ws.max_row, (total_row or header_row + len(period_rows) + 1)))
             ws.cell(row=header_row, column=current_total_col, value=target_header)
-            for r in range(header_row + 1, header_row + 13):
+            for r in period_rows:
                 ws.cell(row=r, column=current_total_col, value=None)
                 ws.cell(row=r, column=current_total_col).number_format = "0.00"
             target_col = current_total_col
@@ -2142,12 +2235,20 @@ def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name:
                     if normalized_header_key(ws.cell(row=header_row, column=c).value) not in fixed]
     if not dynamic_cols:
         raise ValueError(f"工作表“{ws.title}”没有可写入的 Credit 收入栏。")
-    first_data_row, last_data_row, total_row = header_row + 1, header_row + 12, header_row + 13
-    for r in range(first_data_row, last_data_row + 1):
+    if not period_rows:
+        raise ValueError(f"工作表“{ws.title}”没有可识别的日期/期间行。")
+    if total_row is None:
+        total_row = period_rows[-1] + 1
+        if begin_col > 1:
+            ws.cell(total_row, begin_col - 1, "TOTAL")
+
+    for r in period_rows:
         a = ws.cell(r, dynamic_cols[0]).coordinate
         b = ws.cell(r, dynamic_cols[-1]).coordinate
         ws.cell(r, total_credit_col, f"=SUM({a}:{b})")
         ws.cell(r, ending_col, f"={ws.cell(r, begin_col).coordinate}+{ws.cell(r, total_credit_col).coordinate}-{ws.cell(r, debit_col).coordinate}")
+
+    first_data_row, last_data_row = period_rows[0], period_rows[-1]
     for c in dynamic_cols + [total_credit_col, debit_col]:
         ws.cell(total_row, c, f"=SUM({ws.cell(first_data_row,c).coordinate}:{ws.cell(last_data_row,c).coordinate})")
     ws.cell(total_row, ending_col, f"={ws.cell(last_data_row, ending_col).coordinate}")
@@ -2158,6 +2259,11 @@ def update_debit_sheet_in_place(ws, rows, selected_month_index: int):
     if layout is None:
         raise ValueError(f"工作表“{ws.title}”不是可识别的 Debit 格式。")
     header_row, merchant_col, month_cols, total_col, category_col = layout
+    if selected_month_index < 0 or selected_month_index >= len(month_cols):
+        raise ValueError(
+            f"工作表“{ws.title}”只有 {len(month_cols)} 个可写入日期/期间，"
+            f"无法写入第 {selected_month_index + 1} 个。"
+        )
     selected_col = month_cols[selected_month_index]
     rules = load_category_rules()
     merged = merge_same_merchants(rows)
@@ -2188,7 +2294,7 @@ def update_debit_sheet_in_place(ws, rows, selected_month_index: int):
                 ws.cell(r, category_col, get_category_for_merchant(merchant, rules))
             merchant_rows[merchant.casefold()] = r
         append_amount_to_cell(ws.cell(r, selected_col), data["amounts"])
-        ws.cell(r, total_col, f"=SUM({ws.cell(r,month_cols[0]).coordinate}:{ws.cell(r,month_cols[-1]).coordinate})")
+        ws.cell(r, total_col, build_sum_formula_for_columns(ws, r, month_cols))
     ws.cell(total_row, merchant_col, "Total")
     first_data_row, last_data_row = header_row + 1, total_row - 1
     if last_data_row >= first_data_row:
@@ -2196,7 +2302,7 @@ def update_debit_sheet_in_place(ws, rows, selected_month_index: int):
             letter = excel_col_letter(c)
             ws.cell(total_row, c, f"=SUM({letter}{first_data_row}:{letter}{last_data_row})")
         ws.cell(total_row, total_col,
-                f"=SUM({ws.cell(total_row,month_cols[0]).coordinate}:{ws.cell(total_row,month_cols[-1]).coordinate})")
+                build_sum_formula_for_columns(ws, total_row, month_cols))
 
 
 def append_rows_to_selected_sheet(xlsx_path: Path, sheet_name: str, rows,
@@ -2269,11 +2375,11 @@ def mk_button(parent, text, cmd):
 
 def run_parser_ui():
     root = tk.Tk()
-    root.title("BSDP - Multi-Sheet Direct Copy v4")
+    root.title("BSDP - Bank Statement Data Processing")
     root.geometry("1120x950")
     root.configure(bg=BG)
 
-    mk_label(root, "BSDP - Multi-Sheet Direct Copy v4", font=("Helvetica", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
+    mk_label(root, "BSDP - Bank Statement Data Processing", font=("Helvetica", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
 
     default_monthly_summary = script_dir() / "credit_monthly_summary.xlsx"
 
@@ -2492,9 +2598,10 @@ def run_parser_ui():
     txt_input.bind("<Return>", keep_cursor_visible)
     txt_input.bind("<<Paste>>", keep_cursor_visible)
 
-    def import_existing_report():
+    def import_existing_report(clear_existing_data: bool):
+        mode_name = "清空旧金额（模板模式）" if clear_existing_data else "保留全部原有数据"
         source = filedialog.askopenfilename(
-            title="选择已有公司报表 Excel",
+            title=f"选择已有公司报表 Excel - {mode_name}",
             filetypes=[("Excel files", "*.xlsx")]
         )
         if not source:
@@ -2502,41 +2609,67 @@ def run_parser_ui():
 
         try:
             target = get_summary_output_path(summary_var.get())
+            action_text = (
+                "可识别页面中的旧月份金额会被清空，但格式、公式框架、Merchant、Category、"
+                "工作表名称和顺序会保留。"
+                if clear_existing_data
+                else
+                "源 Excel 中的所有原有数据、公式、格式、工作表名称和顺序都会完整保留。"
+            )
+
             if target.exists():
                 overwrite = messagebox.askyesno(
-                    "Monthly Summary 已存在",
+                    "目标 Excel 已存在",
                     f"目标文件已经存在：\n{target}\n\n"
-                    "程序会完整复制源文件的全部工作表，并保留名称和顺序。"
-                    "可识别页面中的旧月份金额会被清空。\n\n是否继续？"
+                    f"导入模式：{mode_name}\n"
+                    f"{action_text}\n\n"
+                    "目标文件将被这次导入结果覆盖，是否继续？"
                 )
                 if not overwrite:
                     return
+            else:
+                proceed = messagebox.askyesno(
+                    "确认导入模式",
+                    f"导入模式：{mode_name}\n\n{action_text}\n\n是否继续？"
+                )
+                if not proceed:
+                    return
 
-            status.set("正在导入已有报表模板...")
+            status.set(f"正在导入已有报表：{mode_name}...")
             income_count, expense_count, imported_month_labels, imported_sheet_names = import_existing_report_template(
                 Path(source),
                 target,
                 bank_name=bank_name_var.get().strip() or DEFAULT_BANK_NAME,
+                clear_existing_data=clear_existing_data,
             )
             summary_var.set(str(target))
             refresh_sheet_and_month_options(imported_sheet_names[0] if imported_sheet_names else "")
             status.set(
-                f"模板导入完成：{target.name} | 共 {len(imported_sheet_names)} 个工作表 | "
-                f"当前: {sheet_var.get()}"
+                f"导入完成：{target.name} | 模式: {mode_name} | "
+                f"共 {len(imported_sheet_names)} 个工作表 | 当前: {sheet_var.get()}"
+            )
+
+            result_note = (
+                "可识别页面中的历史月份金额已清空；其他内容已保留。"
+                if clear_existing_data
+                else
+                "所有原有数据、公式和格式均已完整保留，可直接继续追加。"
             )
             messagebox.showinfo(
                 "导入完成",
-                f"Monthly Summary 已建立：\n{target}\n\n"
+                f"目标 Excel：\n{target}\n\n"
+                f"导入模式：{mode_name}\n"
                 f"导入工作表：{len(imported_sheet_names)} 个\n"
                 f"工作表名称：{', '.join(imported_sheet_names)}\n"
                 f"Credit 项目：{income_count}\n"
                 f"Debit Merchant：{expense_count}\n\n"
-                "全部工作表名称已保留；可识别的历史金额已清空，公式与格式已保留。\n"
+                f"{result_note}\n"
                 f"UI 日期顺序：{', '.join(months)}"
             )
         except Exception as e:
             status.set(f"模板导入失败：{type(e).__name__}: {e}")
             messagebox.showerror("导入失败", f"{type(e).__name__}: {e}")
+
 
 
     def start():
@@ -2549,10 +2682,10 @@ def run_parser_ui():
             configure_date_format(resolved_date_format)
 
             selected_month_display = month_var.get().strip()
-            if selected_month_display not in months:
+            selected_month_index = month_box.current()
+            if selected_month_index < 0 or selected_month_index >= len(months):
                 messagebox.showerror("错误", "请选择有效日期/月份")
                 return
-            selected_month_index = months.index(selected_month_display)
 
             selected_sheet = sheet_var.get().strip()
             if not selected_sheet:
@@ -2619,9 +2752,18 @@ def run_parser_ui():
 
     btns = tk.Frame(root, bg=BG)
     btns.pack(pady=12)
-    mk_button(btns, "导入整本 Excel（全部 Sheet）", import_existing_report).grid(row=0, column=0, padx=8)
-    mk_button(btns, "Start", start).grid(row=0, column=1, padx=8)
-    mk_button(btns, "Stop", stop).grid(row=0, column=2, padx=8)
+    mk_button(
+        btns,
+        "导入并清空旧金额",
+        lambda: import_existing_report(True)
+    ).grid(row=0, column=0, padx=8)
+    mk_button(
+        btns,
+        "导入并保留全部数据",
+        lambda: import_existing_report(False)
+    ).grid(row=0, column=1, padx=8)
+    mk_button(btns, "Start", start).grid(row=0, column=2, padx=8)
+    mk_button(btns, "Stop", stop).grid(row=0, column=3, padx=8)
 
     root.mainloop()
 
