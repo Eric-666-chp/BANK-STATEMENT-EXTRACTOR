@@ -2344,6 +2344,159 @@ def get_summary_output_path(base_path_str: str) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     return folder / "credit_monthly_summary.xlsx"
 
+
+# ================= 当前工作表重复 Merchant 合并 =================
+
+def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str):
+    """在指定工作表中原地合并重复 Merchant。
+
+    先完整读取并汇总所有重复行的数据，再删除重复行。这样即使月份/日期列位于
+    Total 或 Category 后面（例如 6-Aug），其中的数据也不会因为先删行而丢失。
+    其他工作表不会被修改。
+    """
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"找不到 Excel 文件：{xlsx_path}")
+    if not sheet_name:
+        raise ValueError("请先在 UI 中选择工作表。")
+
+    wb = load_workbook(xlsx_path, data_only=False)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Excel 中找不到工作表：{sheet_name}")
+
+        ws = wb[sheet_name]
+        header_row = find_header_row(ws, ["Merchant"])
+        if header_row is None:
+            raise ValueError("当前工作表中找不到 Merchant 表头。")
+
+        merchant_col = find_column_by_header(
+            ws, header_row, ["Merchant", "Vendor", "Description"]
+        )
+        total_col = find_column_by_header(
+            ws, header_row, ["Total", "Amount Total", "Grand Total"]
+        )
+        category_col = find_column_by_header(
+            ws, header_row, ["Category", "Class"]
+        )
+        if merchant_col is None:
+            raise ValueError("当前工作表中找不到 Merchant 列。")
+        if total_col is None:
+            raise ValueError("当前工作表中找不到 Total 列。")
+
+        # 1) Merchant 与 Total 之间的所有列。
+        period_cols = list(range(merchant_col + 1, total_col))
+
+        # 2) Total/Category 后面继续出现的月份或日期列，例如 6-Aug。
+        # 必须在读取明细和删除行之前确定并保存这些列。
+        for col in range(total_col + 1, ws.max_column + 1):
+            if col == category_col:
+                continue
+            if looks_like_period_header(ws.cell(row=header_row, column=col)):
+                period_cols.append(col)
+
+        period_cols = sorted(set(period_cols))
+        if not period_cols:
+            raise ValueError("当前工作表中找不到可合并的月份或日期列。")
+
+        # 明细区域截止到 Merchant 列中的 Total 行之前。
+        summary_row = None
+        for row in range(header_row + 1, ws.max_row + 1):
+            key = normalized_header_key(ws.cell(row=row, column=merchant_col).value)
+            if key in {"TOTAL", "GRAND TOTAL"}:
+                summary_row = row
+                break
+        data_end_row = summary_row - 1 if summary_row else ws.max_row
+
+        # 先做完整快照。不能一边读取一边删除，否则 Category 后面的期间数据
+        # 可能跟随重复行一起被删除。
+        groups = OrderedDict()
+        for row in range(header_row + 1, data_end_row + 1):
+            merchant_value = ws.cell(row=row, column=merchant_col).value
+            merchant_text = normalized_cell_text(merchant_value)
+            if not merchant_text:
+                continue
+
+            key = merchant_text.casefold()
+            if key not in groups:
+                groups[key] = {
+                    "keeper": row,
+                    "rows": [],
+                    "period_values": {col: [] for col in period_cols},
+                }
+
+            groups[key]["rows"].append(row)
+            for col in period_cols:
+                # 保存原始值/公式；此时尚未删除任何行。
+                groups[key]["period_values"][col].append(
+                    ws.cell(row=row, column=col).value
+                )
+
+        duplicate_rows = []
+        merged_groups = 0
+
+        # 先把每一组的所有期间数据写入保留行。
+        for data in groups.values():
+            rows = data["rows"]
+            if len(rows) <= 1:
+                continue
+
+            merged_groups += 1
+            keep_row = data["keeper"]
+            duplicate_rows.extend(rows[1:])
+
+            for col in period_cols:
+                all_parts = []
+                for value in data["period_values"][col]:
+                    all_parts.extend(split_formula_parts(value))
+                ws.cell(row=keep_row, column=col).value = (
+                    build_plus_formula(all_parts) or None
+                )
+
+            # Total 只计算真正的期间列，不包含 Category。
+            ws.cell(row=keep_row, column=total_col).value = build_sum_formula_for_columns(
+                ws, keep_row, period_cols
+            )
+
+        # 所有 Category 后面的月份数据已经汇总写入后，才从底部删除重复行。
+        for row in sorted(duplicate_rows, reverse=True):
+            ws.delete_rows(row, 1)
+
+        # 删除后重新定位 Total 行，并重建明细 Total 与底部汇总公式。
+        new_summary_row = None
+        for row in range(header_row + 1, ws.max_row + 1):
+            key = normalized_header_key(ws.cell(row=row, column=merchant_col).value)
+            if key in {"TOTAL", "GRAND TOTAL"}:
+                new_summary_row = row
+                break
+
+        if new_summary_row is not None:
+            first_data_row = header_row + 1
+            last_data_row = new_summary_row - 1
+            if last_data_row >= first_data_row:
+                for row in range(first_data_row, last_data_row + 1):
+                    ws.cell(row=row, column=total_col).value = build_sum_formula_for_columns(
+                        ws, row, period_cols
+                    )
+
+                for col in period_cols:
+                    letter = excel_col_letter(col)
+                    ws.cell(row=new_summary_row, column=col).value = (
+                        f"=SUM({letter}{first_data_row}:{letter}{last_data_row})"
+                    )
+
+                ws.cell(row=new_summary_row, column=total_col).value = (
+                    build_sum_formula_for_columns(ws, new_summary_row, period_cols)
+                )
+
+        wb.save(xlsx_path)
+        return {
+            "merged_groups": merged_groups,
+            "removed_rows": len(duplicate_rows),
+            "period_columns": len(period_cols),
+        }
+    finally:
+        wb.close()
+
 # ================= GUI =================
 
 import tkinter as tk
@@ -2509,8 +2662,9 @@ def run_parser_ui():
         txt_input.focus_set()
         status.set("文本框已清空 (Text box cleared)")
 
-    clear_btn = mk_button(control_row, "清空文本框", clear_textbox)
-    clear_btn.pack(side="right", padx=(10, 0))
+    # 右上角操作按钮区域：Start 和清空文本框会在函数定义完成后加入
+    top_action_buttons = tk.Frame(control_row, bg=BG)
+    top_action_buttons.pack(side="right", padx=(10, 0))
 
     def refresh_sheet_and_month_options(preferred_sheet: str = ""):
         path = get_summary_output_path(summary_var.get())
@@ -2716,15 +2870,64 @@ def run_parser_ui():
             messagebox.showerror("异常 / Error", f"{type(e).__name__}: {e}")
             status.set(f"解析失败 / Failed: {type(e).__name__}: {e}")
 
-    def stop():
-        root.destroy()
+    def merge_current_sheet():
+        try:
+            selected_sheet = sheet_var.get().strip()
+            if not selected_sheet:
+                messagebox.showerror("错误", "请先选择要合并的工作表")
+                return
 
-    # ---------- 底部按钮：导入在左，Start/Stop 居中 ----------
+            summary_xlsx = get_summary_output_path(summary_var.get())
+            confirm = messagebox.askyesno(
+                "确认合并",
+                f"将在当前 Excel 中直接处理工作表：\n{selected_sheet}\n\n"
+                "会合并 Merchant 与 Total 之间的月份数据，\n"
+                "以及 Category 后面额外出现的月份/日期列。\n"
+                "其他工作表不会被修改。\n\n"
+                "执行前请关闭 Excel 文件，是否继续？"
+            )
+            if not confirm:
+                return
+
+            status.set(f"正在合并当前工作表：{selected_sheet}...")
+            result = merge_duplicate_merchants_in_selected_sheet(
+                summary_xlsx, selected_sheet
+            )
+            refresh_sheet_and_month_options(selected_sheet)
+
+            status.set(
+                f"合并完成 | 工作表: {selected_sheet} | "
+                f"合并组数: {result['merged_groups']} | "
+                f"删除重复行: {result['removed_rows']}"
+            )
+            messagebox.showinfo(
+                "合并完成",
+                f"Excel：{summary_xlsx.name}\n"
+                f"工作表：{selected_sheet}\n"
+                f"月份列数量：{result['period_columns']}\n"
+                f"合并 Merchant 组数：{result['merged_groups']}\n"
+                f"删除重复行数：{result['removed_rows']}\n\n"
+                "仅当前选择的工作表被处理。"
+            )
+        except PermissionError:
+            status.set("合并失败：Excel 文件可能正在打开")
+            messagebox.showerror(
+                "无法保存",
+                "Excel 文件可能正在打开。请关闭 Excel 后再执行。"
+            )
+        except Exception as e:
+            status.set(f"合并失败：{type(e).__name__}: {e}")
+            messagebox.showerror("合并失败", f"{type(e).__name__}: {e}")
+
+    # ---------- 右上角按钮：按照界面布局放置 Start 和清空文本框 ----------
+    mk_button(top_action_buttons, "Start", start).pack(side="left", padx=(0, 10))
+    mk_button(top_action_buttons, "清空文本框", clear_textbox).pack(side="left")
+
+    # ---------- 底部按钮：导入按钮靠左，合并按钮靠右 ----------
     footer = tk.Frame(root, bg=BG)
     footer.pack(fill="x", padx=10, pady=(6, 12))
     footer.columnconfigure(0, weight=1)
     footer.columnconfigure(1, weight=1)
-    footer.columnconfigure(2, weight=1)
 
     import_buttons = tk.Frame(footer, bg=BG)
     import_buttons.grid(row=0, column=0, sticky="w")
@@ -2735,10 +2938,9 @@ def run_parser_ui():
         side="left", padx=(0, 8)
     )
 
-    run_buttons = tk.Frame(footer, bg=BG)
-    run_buttons.grid(row=0, column=1)
-    mk_button(run_buttons, "Start", start).pack(side="left", padx=6)
-    mk_button(run_buttons, "Stop", stop).pack(side="left", padx=6)
+    merge_buttons = tk.Frame(footer, bg=BG)
+    merge_buttons.grid(row=0, column=1, sticky="e")
+    mk_button(merge_buttons, "合并当前 Sheet", merge_current_sheet).pack(side="right")
 
     root.mainloop()
 
