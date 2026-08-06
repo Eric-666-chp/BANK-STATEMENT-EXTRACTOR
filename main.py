@@ -3,6 +3,7 @@ import csv
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -288,7 +289,7 @@ CREDIT_TOTAL_HEADER = "TOTAL CREDIT"
 CREDIT_DEBIT_HEADER = "DEBIT"
 CREDIT_ENDING_HEADER = "ENDING BALANCE"
 CREDIT_BEGIN_HEADER = "BEGIN BALANCE"
-DEFAULT_BANK_NAME = "CHASE #3444"
+DEFAULT_BANK_NAME = ""
 
 CREDIT_MONTH_ROWS = {
     "JAN": 3,
@@ -1964,7 +1965,7 @@ def import_existing_report_template(
         source_wb.close()
 
     if not source_sheet_names:
-        raise ValueError("源 Excel 中没有可读取的工作表。")
+        raise ValueError("源 Excel 中没有可读取的Excel Sheet。")
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1990,9 +1991,9 @@ def import_existing_report_template(
 
         if copied_sheet_names != source_sheet_names:
             raise RuntimeError(
-                "工作表复制验证失败。\n"
-                f"源文件工作表({len(source_sheet_names)}): {source_sheet_names}\n"
-                f"复制后工作表({len(copied_sheet_names)}): {copied_sheet_names}"
+                "Excel Sheet复制验证失败。\n"
+                f"源文件Excel Sheet({len(source_sheet_names)}): {source_sheet_names}\n"
+                f"复制后Excel Sheet({len(copied_sheet_names)}): {copied_sheet_names}"
             )
 
         wb = load_workbook(temp_path, data_only=False)
@@ -2038,7 +2039,7 @@ def import_existing_report_template(
             before_save_names = list(wb.sheetnames)
             if before_save_names != source_sheet_names:
                 raise RuntimeError(
-                    "处理过程中工作表名称或数量发生变化。\n"
+                    "处理过程中Excel Sheet名称或数量发生变化。\n"
                     f"源文件: {source_sheet_names}\n处理后: {before_save_names}"
                 )
             wb.save(temp_path)
@@ -2054,9 +2055,9 @@ def import_existing_report_template(
 
         if final_sheet_names != source_sheet_names:
             raise RuntimeError(
-                "保存后的工作表验证失败。\n"
-                f"源文件工作表({len(source_sheet_names)}): {source_sheet_names}\n"
-                f"保存后工作表({len(final_sheet_names)}): {final_sheet_names}"
+                "保存后的Excel Sheet验证失败。\n"
+                f"源文件Excel Sheet({len(source_sheet_names)}): {source_sheet_names}\n"
+                f"保存后Excel Sheet({len(final_sheet_names)}): {final_sheet_names}"
             )
 
         # 所有验证通过后再替换正式目标文件。
@@ -2192,12 +2193,12 @@ def find_debit_layout(ws):
 def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name: str = DEFAULT_BANK_NAME):
     header_row, header_map = find_credit_layout(ws)
     if header_row is None:
-        raise ValueError(f"工作表“{ws.title}”不是可识别的 Credit 格式。")
+        raise ValueError(f"Excel Sheet“{ws.title}”不是可识别的 Credit 格式。")
     begin_col = header_map[CREDIT_BEGIN_HEADER]
     period_rows, total_row = find_credit_period_rows(ws, header_row, begin_col)
     if selected_month_index < 0 or selected_month_index >= len(period_rows):
         raise ValueError(
-            f"工作表“{ws.title}”只有 {len(period_rows)} 个可写入日期/期间，"
+            f"Excel Sheet“{ws.title}”只有 {len(period_rows)} 个可写入日期/期间，"
             f"无法写入第 {selected_month_index + 1} 个。"
         )
     month_row = period_rows[selected_month_index]
@@ -2234,9 +2235,9 @@ def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name:
     dynamic_cols = [c for c in range(begin_col + 1, total_credit_col)
                     if normalized_header_key(ws.cell(row=header_row, column=c).value) not in fixed]
     if not dynamic_cols:
-        raise ValueError(f"工作表“{ws.title}”没有可写入的 Credit 收入栏。")
+        raise ValueError(f"Excel Sheet“{ws.title}”没有可写入的 Credit 收入栏。")
     if not period_rows:
-        raise ValueError(f"工作表“{ws.title}”没有可识别的日期/期间行。")
+        raise ValueError(f"Excel Sheet“{ws.title}”没有可识别的日期/期间行。")
     if total_row is None:
         total_row = period_rows[-1] + 1
         if begin_col > 1:
@@ -2257,11 +2258,11 @@ def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name:
 def update_debit_sheet_in_place(ws, rows, selected_month_index: int):
     layout = find_debit_layout(ws)
     if layout is None:
-        raise ValueError(f"工作表“{ws.title}”不是可识别的 Debit 格式。")
+        raise ValueError(f"Excel Sheet“{ws.title}”不是可识别的 Debit 格式。")
     header_row, merchant_col, month_cols, total_col, category_col = layout
     if selected_month_index < 0 or selected_month_index >= len(month_cols):
         raise ValueError(
-            f"工作表“{ws.title}”只有 {len(month_cols)} 个可写入日期/期间，"
+            f"Excel Sheet“{ws.title}”只有 {len(month_cols)} 个可写入日期/期间，"
             f"无法写入第 {selected_month_index + 1} 个。"
         )
     selected_col = month_cols[selected_month_index]
@@ -2314,7 +2315,7 @@ def append_rows_to_selected_sheet(xlsx_path: Path, sheet_name: str, rows,
     wb = load_workbook(xlsx_path, data_only=False)
     try:
         if sheet_name not in wb.sheetnames:
-            raise ValueError(f"Excel 中找不到工作表：{sheet_name}")
+            raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
         ws = wb[sheet_name]
         if str(account_type).strip().lower() == "credit":
             update_credit_sheet_in_place(ws, rows, selected_month_index, bank_name)
@@ -2357,17 +2358,17 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
     if not xlsx_path.exists():
         raise FileNotFoundError(f"找不到 Excel 文件：{xlsx_path}")
     if not sheet_name:
-        raise ValueError("请先在 UI 中选择工作表。")
+        raise ValueError("请先在 UI 中选择Excel Sheet。")
 
     wb = load_workbook(xlsx_path, data_only=False)
     try:
         if sheet_name not in wb.sheetnames:
-            raise ValueError(f"Excel 中找不到工作表：{sheet_name}")
+            raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
 
         ws = wb[sheet_name]
         header_row = find_header_row(ws, ["Merchant"])
         if header_row is None:
-            raise ValueError("当前工作表中找不到 Merchant 表头。")
+            raise ValueError("当前Excel Sheet中找不到 Merchant 表头。")
 
         merchant_col = find_column_by_header(
             ws, header_row, ["Merchant", "Vendor", "Description"]
@@ -2379,9 +2380,9 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
             ws, header_row, ["Category", "Class"]
         )
         if merchant_col is None:
-            raise ValueError("当前工作表中找不到 Merchant 列。")
+            raise ValueError("当前Excel Sheet中找不到 Merchant 列。")
         if total_col is None:
-            raise ValueError("当前工作表中找不到 Total 列。")
+            raise ValueError("当前Excel Sheet中找不到 Total 列。")
 
         # 1) Merchant 与 Total 之间的所有列。
         period_cols = list(range(merchant_col + 1, total_col))
@@ -2396,7 +2397,7 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
 
         period_cols = sorted(set(period_cols))
         if not period_cols:
-            raise ValueError("当前工作表中找不到可合并的月份或日期列。")
+            raise ValueError("当前Excel Sheet中找不到可合并的月份或日期列。")
 
         # 明细区域截止到 Merchant 列中的 Total 行之前。
         summary_row = None
@@ -2549,7 +2550,7 @@ def run_parser_ui():
     account_type_var = tk.StringVar(value="Credit")
     bank_name_var = tk.StringVar(value=DEFAULT_BANK_NAME)
     sheet_var = tk.StringVar(value="")
-    status = tk.StringVar(value="尚未开始(Not started)")
+    status_history: List[str] = []
 
     sheet_names: List[str] = []
     months = list(initial_month_labels)
@@ -2660,7 +2661,7 @@ def run_parser_ui():
         txt_input.delete("1.0", tk.END)
         txt_input.edit_reset()
         txt_input.focus_set()
-        status.set("文本框已清空 (Text box cleared)")
+        log_status("文本框已清空 (Text box cleared)")
 
     # 右上角操作按钮区域：Start 和清空文本框会在函数定义完成后加入
     top_action_buttons = tk.Frame(control_row, bg=BG)
@@ -2689,20 +2690,20 @@ def run_parser_ui():
 
     def choose_summary():
         p = filedialog.askopenfilename(
-            title="选择需要继续写入的 Excel（支持多个工作表）",
+            title="选择需要继续写入的 Excel（支持多个Excel Sheet）",
             filetypes=[("Excel files", "*.xlsx")]
         )
         if p:
             summary_var.set(p)
             refresh_sheet_and_month_options()
-            status.set(f"已选择 Excel: {Path(p).name}")
+            log_status(f"已选择 Excel: {Path(p).name}")
 
     browse_btn = mk_button(filebar, "选择 Excel(Browse)", choose_summary)
     browse_btn.grid(row=0, column=2, sticky="e", pady=3)
 
     def on_month_selected(event=None):
-        status.set(
-            f"已选择工作表: {sheet_var.get()} | 日期: {month_var.get()} | "
+        log_status(
+            f"已选择Excel Sheet: {sheet_var.get()} | 日期: {month_var.get()} | "
             f"类型: {account_type_var.get()}"
         )
 
@@ -2730,11 +2731,40 @@ def run_parser_ui():
     txt_input.bind("<Return>", keep_cursor_visible)
     txt_input.bind("<<Paste>>", keep_cursor_visible)
 
-    # ---------- 状态 ----------
+    # ---------- 最近三次操作记录 ----------
     status_frame = tk.Frame(root, bg=BG)
     status_frame.pack(fill="x", padx=12, pady=(5, 2))
-    mk_label(status_frame, "状态(Status)：").pack(anchor="w")
-    mk_label(status_frame, "", fg="#9cdcfe", textvariable=status).pack(anchor="w")
+    mk_label(status_frame, "最近操作(Recent operations)：").pack(anchor="w")
+
+    status_text = tk.Text(
+        status_frame,
+        height=3,
+        wrap="none",
+        bg=BG,
+        fg="#9cdcfe",
+        insertbackground="#9cdcfe",
+        relief="flat",
+        bd=0,
+        highlightthickness=0,
+        takefocus=0,
+        state="disabled",
+        font=("Helvetica", 9),
+    )
+    status_text.pack(fill="x", anchor="w")
+
+    def log_status(message: str):
+        """Add one timestamped status entry and keep only the latest three."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        status_history.append(f"[{timestamp}] {message}")
+        del status_history[:-3]
+
+        status_text.configure(state="normal")
+        status_text.delete("1.0", tk.END)
+        status_text.insert("1.0", "\n".join(status_history))
+        status_text.configure(state="disabled")
+        status_text.see(tk.END)
+
+    log_status("尚未开始 (Not started)")
 
     def import_existing_report(clear_existing_data: bool):
         mode_name = "清空旧金额（模板模式）" if clear_existing_data else "保留全部原有数据"
@@ -2749,10 +2779,10 @@ def run_parser_ui():
             target = get_summary_output_path(summary_var.get())
             action_text = (
                 "可识别页面中的旧月份金额会被清空，但格式、公式框架、Merchant、Category、"
-                "工作表名称和顺序会保留。"
+                "Excel Sheet名称和顺序会保留。"
                 if clear_existing_data
                 else
-                "源 Excel 中的所有原有数据、公式、格式、工作表名称和顺序都会完整保留。"
+                "源 Excel 中的所有原有数据、公式、格式、Excel Sheet名称和顺序都会完整保留。"
             )
 
             if target.exists():
@@ -2772,7 +2802,7 @@ def run_parser_ui():
                 if not proceed:
                     return
 
-            status.set(f"正在导入已有报表：{mode_name}...")
+            log_status(f"正在导入已有报表：{mode_name}...")
             income_count, expense_count, imported_month_labels, imported_sheet_names = import_existing_report_template(
                 Path(source), target,
                 bank_name=bank_name_var.get().strip() or DEFAULT_BANK_NAME,
@@ -2780,9 +2810,9 @@ def run_parser_ui():
             )
             summary_var.set(str(target))
             refresh_sheet_and_month_options(imported_sheet_names[0] if imported_sheet_names else "")
-            status.set(
+            log_status(
                 f"导入完成：{target.name} | 模式: {mode_name} | "
-                f"共 {len(imported_sheet_names)} 个工作表 | 当前: {sheet_var.get()}"
+                f"共 {len(imported_sheet_names)} 个Excel Sheet | 当前: {sheet_var.get()}"
             )
 
             result_note = (
@@ -2795,15 +2825,15 @@ def run_parser_ui():
                 "导入完成",
                 f"目标 Excel：\n{target}\n\n"
                 f"导入模式：{mode_name}\n"
-                f"导入工作表：{len(imported_sheet_names)} 个\n"
-                f"工作表名称：{', '.join(imported_sheet_names)}\n"
+                f"导入Excel Sheet：{len(imported_sheet_names)} 个\n"
+                f"Excel Sheet名称：{', '.join(imported_sheet_names)}\n"
                 f"Credit 项目：{income_count}\n"
                 f"Debit Merchant：{expense_count}\n\n"
                 f"{result_note}\n"
                 f"UI 日期顺序：{', '.join(months)}"
             )
         except Exception as e:
-            status.set(f"模板导入失败：{type(e).__name__}: {e}")
+            log_status(f"模板导入失败：{type(e).__name__}: {e}")
             messagebox.showerror("导入失败", f"{type(e).__name__}: {e}")
 
     def start():
@@ -2821,7 +2851,7 @@ def run_parser_ui():
 
             selected_sheet = sheet_var.get().strip()
             if not selected_sheet:
-                messagebox.showerror("错误", "请选择要修改的工作表/Page")
+                messagebox.showerror("错误", "请选择要修改的Excel Sheet/Page")
                 return
 
             selected_account_type = account_type_var.get().strip().lower()
@@ -2831,8 +2861,8 @@ def run_parser_ui():
 
             bank_name = bank_name_var.get().strip() or DEFAULT_BANK_NAME
             remove_items = parse_remove_items(remove_var.get())
-            status.set(
-                f"正在处理... 工作表: {selected_sheet} | 日期: {selected_month_display} | "
+            log_status(
+                f"正在处理... Excel Sheet: {selected_sheet} | 日期: {selected_month_display} | "
                 f"类型: {selected_account_type.title()}"
             )
 
@@ -2847,8 +2877,8 @@ def run_parser_ui():
                 bank_name=bank_name,
             )
 
-            status.set(
-                f"已完成 / Completed | 工作表: {selected_sheet} | 日期: {selected_month_display} | "
+            log_status(
+                f"已完成 / Completed | Excel Sheet: {selected_sheet} | 日期: {selected_month_display} | "
                 f"类型: {selected_account_type.title()} | 总表: {summary_xlsx.name}"
             )
             date_format_display = (
@@ -2858,7 +2888,7 @@ def run_parser_ui():
             messagebox.showinfo(
                 "Completed",
                 f"提取成功: {len(rows)} 笔交易\n"
-                f"当前工作表: {selected_sheet}\n"
+                f"当前Excel Sheet: {selected_sheet}\n"
                 f"当前日期: {selected_month_display}\n"
                 f"当前类型: {selected_account_type.title()}\n"
                 "写入方式: 保留原有数据并继续追加\n"
@@ -2868,55 +2898,46 @@ def run_parser_ui():
             )
         except Exception as e:
             messagebox.showerror("异常 / Error", f"{type(e).__name__}: {e}")
-            status.set(f"解析失败 / Failed: {type(e).__name__}: {e}")
+            log_status(f"解析失败 / Failed: {type(e).__name__}: {e}")
 
     def merge_current_sheet():
         try:
             selected_sheet = sheet_var.get().strip()
             if not selected_sheet:
-                messagebox.showerror("错误", "请先选择要合并的工作表")
+                messagebox.showerror("错误", "请先选择要合并的Excel Sheet")
                 return
 
             summary_xlsx = get_summary_output_path(summary_var.get())
             confirm = messagebox.askyesno(
                 "确认合并",
-                f"将在当前 Excel 中直接处理工作表：\n{selected_sheet}\n\n"
-                "会合并 Merchant 与 Total 之间的月份数据，\n"
-                "以及 Category 后面额外出现的月份/日期列。\n"
-                "其他工作表不会被修改。\n\n"
+                f"将在当前 Excel 中直接处理Excel Sheet：\n{selected_sheet}\n\n"
                 "执行前请关闭 Excel 文件，是否继续？"
             )
             if not confirm:
                 return
 
-            status.set(f"正在合并当前工作表：{selected_sheet}...")
+            log_status(f"正在合并当前Excel Sheet：{selected_sheet}...")
             result = merge_duplicate_merchants_in_selected_sheet(
                 summary_xlsx, selected_sheet
             )
             refresh_sheet_and_month_options(selected_sheet)
 
-            status.set(
-                f"合并完成 | 工作表: {selected_sheet} | "
-                f"合并组数: {result['merged_groups']} | "
-                f"删除重复行: {result['removed_rows']}"
+            log_status(
+                f"合并完成 | Excel Sheet: {selected_sheet} | "
             )
             messagebox.showinfo(
                 "合并完成",
-                f"Excel：{summary_xlsx.name}\n"
-                f"工作表：{selected_sheet}\n"
-                f"月份列数量：{result['period_columns']}\n"
-                f"合并 Merchant 组数：{result['merged_groups']}\n"
-                f"删除重复行数：{result['removed_rows']}\n\n"
-                "仅当前选择的工作表被处理。"
+                f"Excel Sheet：{selected_sheet} 合并完成\n"
+
             )
         except PermissionError:
-            status.set("合并失败：Excel 文件可能正在打开")
+            log_status("合并失败：Excel 文件可能正在打开")
             messagebox.showerror(
                 "无法保存",
                 "Excel 文件可能正在打开。请关闭 Excel 后再执行。"
             )
         except Exception as e:
-            status.set(f"合并失败：{type(e).__name__}: {e}")
+            log_status(f"合并失败：{type(e).__name__}: {e}")
             messagebox.showerror("合并失败", f"{type(e).__name__}: {e}")
 
     # ---------- 右上角按钮：按照界面布局放置 Start 和清空文本框 ----------
