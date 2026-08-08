@@ -1526,17 +1526,102 @@ def extract_income_headers_from_merchant_layout(ws) -> List[str]:
     return headers
 
 
-def display_cell_text(cell) -> str:
-    """Return a readable Excel cell value while preserving date-like labels."""
+DIRECT_SHEET_REF_RE = re.compile(
+    r"^\s*=\s*\+?\s*(?:'((?:[^']|'')+)'|([^'!]+))!\s*(\$?[A-Z]{1,3}\$?\d+)\s*$",
+    re.IGNORECASE,
+)
+
+DIRECT_LOCAL_REF_RE = re.compile(
+    r"^\s*=\s*\+?\s*(\$?[A-Z]{1,3}\$?\d+)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_direct_reference_cell(cell, visited=None):
+    """Resolve a simple Excel reference formula to the cell it points to.
+
+    Supported examples:
+      ='CHASE #3444'!A3
+      =Income!$B$4
+      =A3
+
+    Only direct cell references are followed. Arithmetic/functions are deliberately
+    left untouched so the program never tries to become a full Excel formula engine.
+    References are followed recursively with cycle protection.
+    """
     value = cell.value
+    if not isinstance(value, str) or not value.lstrip().startswith("="):
+        return cell
+
+    visited = set(visited or ())
+    try:
+        key = (cell.parent.title, cell.coordinate)
+    except Exception:
+        return cell
+    if key in visited:
+        return cell
+    visited.add(key)
+
+    formula = value.strip()
+    workbook = getattr(cell.parent, "parent", None)
+    if workbook is None:
+        return cell
+
+    match = DIRECT_SHEET_REF_RE.fullmatch(formula)
+    if match:
+        quoted_name, plain_name, coordinate = match.groups()
+        sheet_name = (quoted_name if quoted_name is not None else plain_name).strip()
+        sheet_name = sheet_name.replace("''", "'")
+        coordinate = coordinate.replace("$", "")
+        if sheet_name not in workbook.sheetnames:
+            return cell
+        target = workbook[sheet_name][coordinate]
+        return _resolve_direct_reference_cell(target, visited)
+
+    match = DIRECT_LOCAL_REF_RE.fullmatch(formula)
+    if match:
+        coordinate = match.group(1).replace("$", "")
+        target = cell.parent[coordinate]
+        return _resolve_direct_reference_cell(target, visited)
+
+    return cell
+
+
+def display_cell_text(cell) -> str:
+    """Return the actual readable label represented by an Excel cell.
+
+    If the cell is a direct formula reference to another sheet (for example
+    ``='CHASE #3444'!A3``), follow the reference first and display the source
+    cell's real value. This is especially important for Month headers used by
+    the UI. The current sheet/row/column remains the write target; only the
+    display label is resolved from the referenced cell.
+    """
+    resolved_cell = _resolve_direct_reference_cell(cell)
+    value = resolved_cell.value
     if value is None:
         return ""
 
     # Excel date/datetime cells should be displayed using their own number format
     # where possible, instead of Python's ``2026-01-01 00:00:00`` representation.
     try:
-        if getattr(cell, "is_date", False) and hasattr(value, "strftime"):
-            fmt = str(cell.number_format or "").lower()
+        if getattr(resolved_cell, "is_date", False) and hasattr(value, "strftime"):
+            fmt = str(resolved_cell.number_format or "").lower()
+
+            # Preserve common month-header formats such as Apr-24 / April-2024
+            # instead of converting them to a full numeric date.
+            month_token = None
+            if "mmmm" in fmt:
+                month_token = "%B"
+            elif "mmm" in fmt:
+                month_token = "%b"
+
+            year_token = "%Y" if "yyyy" in fmt else ("%y" if "yy" in fmt else None)
+            if month_token and year_token:
+                sep = "-" if "-" in fmt else ("/" if "/" in fmt else " ")
+                return value.strftime(month_token) + sep + value.strftime(year_token)
+            if month_token:
+                return value.strftime(month_token)
+
             if "yyyy" in fmt:
                 return value.strftime("%m/%d/%Y")
             if "yy" in fmt:
@@ -1561,7 +1646,8 @@ def looks_like_period_header(cell) -> bool:
     if value is None:
         return False
     try:
-        if getattr(cell, "is_date", False):
+        resolved_cell = _resolve_direct_reference_cell(cell)
+        if getattr(resolved_cell, "is_date", False):
             return True
     except Exception:
         pass
