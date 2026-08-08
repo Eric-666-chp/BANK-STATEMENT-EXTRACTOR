@@ -2002,15 +2002,26 @@ def import_existing_report_template(
             debit_merchant_count = 0
             month_labels: List[str] = []
 
-            # 注意：这里只读取/修改工作表内容，绝不 remove/create/rename worksheet。
-            for ws in list(wb.worksheets):
-                if not month_labels:
-                    labels = extract_month_labels_from_income_sheet(ws)
-                    if not labels:
-                        labels = extract_month_labels_from_sheet(ws)
+            # Month/period labels must come from a real recognized layout.
+            # Prefer Credit/Income because its period labels are authoritative;
+            # only fall back to Debit/Expense if no Credit sheet is available.
+            for candidate_ws in list(wb.worksheets):
+                credit_header_row, _ = find_credit_layout(candidate_ws)
+                if credit_header_row is not None:
+                    labels = extract_month_labels_from_income_sheet(candidate_ws)
                     if labels:
                         month_labels = list(labels)
+                        break
+            if not month_labels:
+                for candidate_ws in list(wb.worksheets):
+                    if find_debit_layout(candidate_ws) is not None:
+                        labels = extract_month_labels_from_sheet(candidate_ws)
+                        if labels:
+                            month_labels = list(labels)
+                            break
 
+            # 注意：这里只读取/修改工作表内容，绝不 remove/create/rename worksheet。
+            for ws in list(wb.worksheets):
                 header_row, _ = find_credit_layout(ws)
                 if header_row is not None:
                     if clear_existing_data:
@@ -2090,23 +2101,93 @@ def list_workbook_sheet_names(path: Path) -> List[str]:
         wb.close()
 
 
-def read_month_labels_from_selected_sheet(path: Path, sheet_name: str, account_type: str) -> List[str]:
+def get_period_options_from_ws(ws) -> Tuple[str, List[Tuple[str, int]]]:
+    """Auto-detect sheet type and return [(display_label, real_row_or_col), ...].
+
+    Credit options store the real Excel row number.
+    Debit options store the real Excel column number.
+    This keeps the UI linked to the exact worksheet position instead of relying
+    on a separately reconstructed month index.
+    """
+    credit_header_row, credit_map = find_credit_layout(ws)
+    if credit_header_row is not None:
+        begin_col = credit_map[CREDIT_BEGIN_HEADER]
+        period_rows, _ = find_credit_period_rows(ws, credit_header_row, begin_col)
+        options: List[Tuple[str, int]] = []
+        if begin_col > 1:
+            for row in period_rows:
+                label = display_cell_text(ws.cell(row=row, column=begin_col - 1)).strip()
+                if label:
+                    options.append((label, row))
+        if options:
+            return "credit", options
+
+    debit_layout = find_debit_layout(ws)
+    if debit_layout is not None:
+        header_row, _, month_cols, _, _ = debit_layout
+        options = []
+        for col in month_cols:
+            label = display_cell_text(ws.cell(row=header_row, column=col)).strip()
+            if label:
+                options.append((label, col))
+        if options:
+            return "debit", options
+
+    return "", []
+
+
+def read_period_options_from_selected_sheet(path: Path, sheet_name: str) -> Tuple[str, List[Tuple[str, int]]]:
     path = Path(path)
     if not path.exists() or not sheet_name:
-        return list(DEFAULT_UI_MONTH_LABELS)
+        return "", []
     wb = load_workbook(path, read_only=True, data_only=False)
     try:
         if sheet_name not in wb.sheetnames:
-            return list(DEFAULT_UI_MONTH_LABELS)
-        ws = wb[sheet_name]
-        if str(account_type).strip().lower() == "credit":
-            labels = extract_month_labels_from_income_sheet(ws)
-        else:
-            labels = extract_month_labels_from_sheet(ws)
-        return labels if labels else list(DEFAULT_UI_MONTH_LABELS)
+            return "", []
+        return get_period_options_from_ws(wb[sheet_name])
     finally:
         wb.close()
 
+
+def find_first_writable_sheet_name(path: Path, preferred_names: Optional[List[str]] = None) -> str:
+    """Return the first sheet that has a recognized Credit or Debit period layout."""
+    path = Path(path)
+    if not path.exists():
+        return ""
+    wb = load_workbook(path, read_only=True, data_only=False)
+    try:
+        ordered_names = list(preferred_names or []) + [n for n in wb.sheetnames if n not in (preferred_names or [])]
+        for name in ordered_names:
+            if name not in wb.sheetnames:
+                continue
+            _, options = get_period_options_from_ws(wb[name])
+            if options:
+                return name
+        return ""
+    finally:
+        wb.close()
+
+
+def resolve_period_position(ws, sheet_type: str, selected_label: str, selected_position: int) -> int:
+    """Validate the UI mapping before writing; recover by unique label if Excel changed."""
+    current_type, options = get_period_options_from_ws(ws)
+    if current_type != sheet_type:
+        raise ValueError(
+            f"Excel Sheet“{ws.title}”结构已变化，请重新选择该 Sheet 后再试。"
+        )
+
+    for label, position in options:
+        if position == selected_position and label == selected_label:
+            return position
+
+    label_matches = [position for label, position in options if label == selected_label]
+    if len(label_matches) == 1:
+        return label_matches[0]
+
+    raise ValueError(
+        f"日期/期间“{selected_label}”与当前 Excel 位置不一致。"
+        "请重新选择 Excel Sheet 和 Month 后再试。"
+    )
 
 def append_amount_to_cell(cell, amounts: List[str]):
     parts = split_formula_parts(cell.value)
@@ -2190,18 +2271,17 @@ def find_debit_layout(ws):
     return header_row, merchant_col, month_cols, total_col, category_col
 
 
-def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name: str = DEFAULT_BANK_NAME):
+def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: str = DEFAULT_BANK_NAME):
     header_row, header_map = find_credit_layout(ws)
     if header_row is None:
         raise ValueError(f"Excel Sheet“{ws.title}”不是可识别的 Credit 格式。")
     begin_col = header_map[CREDIT_BEGIN_HEADER]
     period_rows, total_row = find_credit_period_rows(ws, header_row, begin_col)
-    if selected_month_index < 0 or selected_month_index >= len(period_rows):
+    if selected_period_row not in period_rows:
         raise ValueError(
-            f"Excel Sheet“{ws.title}”只有 {len(period_rows)} 个可写入日期/期间，"
-            f"无法写入第 {selected_month_index + 1} 个。"
+            f"Excel Sheet“{ws.title}”中的目标日期行已变化，请重新选择 Month 后再试。"
         )
-    month_row = period_rows[selected_month_index]
+    month_row = selected_period_row
     if begin_col > 1:
         bank_cell = ws.cell(row=max(1, header_row - 1), column=begin_col)
         if bank_cell.value is None or str(bank_cell.value).strip() == "":
@@ -2255,17 +2335,16 @@ def update_credit_sheet_in_place(ws, rows, selected_month_index: int, bank_name:
     ws.cell(total_row, ending_col, f"={ws.cell(last_data_row, ending_col).coordinate}")
 
 
-def update_debit_sheet_in_place(ws, rows, selected_month_index: int):
+def update_debit_sheet_in_place(ws, rows, selected_period_col: int):
     layout = find_debit_layout(ws)
     if layout is None:
         raise ValueError(f"Excel Sheet“{ws.title}”不是可识别的 Debit 格式。")
     header_row, merchant_col, month_cols, total_col, category_col = layout
-    if selected_month_index < 0 or selected_month_index >= len(month_cols):
+    if selected_period_col not in month_cols:
         raise ValueError(
-            f"Excel Sheet“{ws.title}”只有 {len(month_cols)} 个可写入日期/期间，"
-            f"无法写入第 {selected_month_index + 1} 个。"
+            f"Excel Sheet“{ws.title}”中的目标日期列已变化，请重新选择 Month 后再试。"
         )
-    selected_col = month_cols[selected_month_index]
+    selected_col = selected_period_col
     rules = load_category_rules()
     merged = merge_same_merchants(rows)
     total_row = None
@@ -2306,9 +2385,11 @@ def update_debit_sheet_in_place(ws, rows, selected_month_index: int):
                 build_sum_formula_for_columns(ws, total_row, month_cols))
 
 
-def append_rows_to_selected_sheet(xlsx_path: Path, sheet_name: str, rows,
-                                  selected_month_index: int, account_type: str,
-                                  bank_name: str = DEFAULT_BANK_NAME):
+def append_rows_to_selected_sheet(
+    xlsx_path: Path, sheet_name: str, rows,
+    selected_period_label: str, selected_period_position: int,
+    expected_sheet_type: str = "", bank_name: str = DEFAULT_BANK_NAME
+):
     xlsx_path = Path(xlsx_path)
     if not xlsx_path.exists():
         raise FileNotFoundError(f"找不到 Excel 文件：{xlsx_path}")
@@ -2317,15 +2398,28 @@ def append_rows_to_selected_sheet(xlsx_path: Path, sheet_name: str, rows,
         if sheet_name not in wb.sheetnames:
             raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
         ws = wb[sheet_name]
-        if str(account_type).strip().lower() == "credit":
-            update_credit_sheet_in_place(ws, rows, selected_month_index, bank_name)
-        elif str(account_type).strip().lower() == "debit":
-            update_debit_sheet_in_place(ws, rows, selected_month_index)
+
+        detected_type, options = get_period_options_from_ws(ws)
+        if not detected_type or not options:
+            raise ValueError(f"Excel Sheet“{sheet_name}”不是可识别的 Credit 或 Debit 格式。")
+        if expected_sheet_type and detected_type != expected_sheet_type:
+            raise ValueError(
+                f"Excel Sheet“{sheet_name}”结构已变化，请重新选择 Sheet 后再试。"
+            )
+
+        real_position = resolve_period_position(
+            ws, detected_type, selected_period_label, selected_period_position
+        )
+
+        if detected_type == "credit":
+            update_credit_sheet_in_place(ws, rows, real_position, bank_name)
         else:
-            raise ValueError("Account Type 必须是 Credit 或 Debit。")
+            update_debit_sheet_in_place(ws, rows, real_position)
         wb.save(xlsx_path)
+        return detected_type
     finally:
         wb.close()
+
 
 # ================= 输出路径 =================
 
@@ -2545,15 +2639,15 @@ def run_parser_ui():
     summary_var = tk.StringVar(value=str(default_monthly_summary.resolve()))
     remove_var = tk.StringVar(value="")
     date_format_var = tk.StringVar(value="")
-    initial_month_labels = read_month_labels_from_path(default_monthly_summary)
-    month_var = tk.StringVar(value=initial_month_labels[0])
-    account_type_var = tk.StringVar(value="Credit")
+    month_var = tk.StringVar(value="")
     bank_name_var = tk.StringVar(value=DEFAULT_BANK_NAME)
     sheet_var = tk.StringVar(value="")
     status_history: List[str] = []
 
     sheet_names: List[str] = []
-    months = list(initial_month_labels)
+    months: List[str] = []
+    period_positions: List[int] = []
+    current_sheet_type = [""]
 
     # ---------- 顶部文件和解析设置 ----------
     filebar = tk.Frame(root, bg=BG)
@@ -2632,12 +2726,6 @@ def run_parser_ui():
     )
     month_box.pack(side="left", padx=(0, 14))
 
-    account_type_box = ttk.Combobox(
-        control_row, textvariable=account_type_var,
-        values=["Credit", "Debit"], width=11, state="readonly"
-    )
-    account_type_box.pack(side="left", padx=(0, 14))
-
     mk_label(
         control_row,
         "在下方文本框输入账单(Please paste your bank statement data below.)",
@@ -2667,26 +2755,42 @@ def run_parser_ui():
     top_action_buttons = tk.Frame(control_row, bg=BG)
     top_action_buttons.pack(side="right", padx=(10, 0))
 
-    def refresh_sheet_and_month_options(preferred_sheet: str = ""):
+    def refresh_sheet_and_month_options(preferred_sheet: str = "", preferred_month: str = ""):
         path = get_summary_output_path(summary_var.get())
         names = list_workbook_sheet_names(path)
         sheet_names[:] = names
         sheet_box["values"] = sheet_names
 
+        previous_sheet = sheet_var.get().strip()
+        previous_month = preferred_month or month_var.get().strip()
+
         selected = preferred_sheet if preferred_sheet in sheet_names else ""
-        if not selected and sheet_var.get() in sheet_names:
-            selected = sheet_var.get()
+        if not selected and previous_sheet in sheet_names:
+            selected = previous_sheet
         if not selected and sheet_names:
-            selected = sheet_names[0]
+            # On first load/import, skip cover/notes sheets and select the first
+            # actually writable Credit/Debit sheet.
+            selected = find_first_writable_sheet_name(path, sheet_names) or sheet_names[0]
         sheet_var.set(selected)
 
-        detected = (
-            read_month_labels_from_selected_sheet(path, selected, account_type_var.get())
-            if selected else list(DEFAULT_UI_MONTH_LABELS)
+        sheet_type, options = (
+            read_period_options_from_selected_sheet(path, selected)
+            if selected else ("", [])
         )
-        months[:] = detected
+        current_sheet_type[0] = sheet_type
+        months[:] = [label for label, _ in options]
+        period_positions[:] = [position for _, position in options]
         month_box["values"] = months
-        month_var.set(months[0] if months else "")
+
+        if previous_month in months:
+            month_var.set(previous_month)
+            month_box.current(months.index(previous_month))
+        elif months:
+            month_var.set(months[0])
+            month_box.current(0)
+        else:
+            month_var.set("")
+            month_box.set("")
 
     def choose_summary():
         p = filedialog.askopenfilename(
@@ -2695,6 +2799,10 @@ def run_parser_ui():
         )
         if p:
             summary_var.set(p)
+            # A newly chosen workbook should select its first writable sheet,
+            # not reuse a same-named sheet/month from the previous workbook.
+            sheet_var.set("")
+            month_var.set("")
             refresh_sheet_and_month_options()
             log_status(f"已选择 Excel: {Path(p).name}")
 
@@ -2702,22 +2810,19 @@ def run_parser_ui():
     browse_btn.grid(row=0, column=2, sticky="e", pady=3)
 
     def on_month_selected(event=None):
+        detected = current_sheet_type[0].title() if current_sheet_type[0] else "Unknown"
         log_status(
             f"已选择Excel Sheet: {sheet_var.get()} | 日期: {month_var.get()} | "
-            f"类型: {account_type_var.get()}"
+            f"自动识别: {detected}"
         )
 
-    def on_account_type_selected(event=None):
-        refresh_sheet_and_month_options(sheet_var.get())
-        on_month_selected()
-
     def on_sheet_selected(event=None):
-        refresh_sheet_and_month_options(sheet_var.get())
+        # Changing sheets refreshes periods from that exact sheet only.
+        refresh_sheet_and_month_options(sheet_var.get(), "")
         on_month_selected()
 
     sheet_box.bind("<<ComboboxSelected>>", on_sheet_selected)
     month_box.bind("<<ComboboxSelected>>", on_month_selected)
-    account_type_box.bind("<<ComboboxSelected>>", on_account_type_selected)
 
     refresh_sheet_and_month_options()
 
@@ -2809,7 +2914,8 @@ def run_parser_ui():
                 clear_existing_data=clear_existing_data,
             )
             summary_var.set(str(target))
-            refresh_sheet_and_month_options(imported_sheet_names[0] if imported_sheet_names else "")
+            first_writable_sheet = find_first_writable_sheet_name(target, imported_sheet_names)
+            refresh_sheet_and_month_options(first_writable_sheet)
             log_status(
                 f"导入完成：{target.name} | 模式: {mode_name} | "
                 f"共 {len(imported_sheet_names)} 个Excel Sheet | 当前: {sheet_var.get()}"
@@ -2845,25 +2951,34 @@ def run_parser_ui():
 
             selected_month_display = month_var.get().strip()
             selected_month_index = month_box.current()
-            if selected_month_index < 0 or selected_month_index >= len(months):
+            if (
+                selected_month_index < 0
+                or selected_month_index >= len(months)
+                or selected_month_index >= len(period_positions)
+            ):
                 messagebox.showerror("错误", "请选择有效日期/月份")
                 return
+            selected_period_position = period_positions[selected_month_index]
 
             selected_sheet = sheet_var.get().strip()
             if not selected_sheet:
                 messagebox.showerror("错误", "请选择要修改的Excel Sheet/Page")
                 return
 
-            selected_account_type = account_type_var.get().strip().lower()
-            if selected_account_type not in ("credit", "debit"):
-                messagebox.showerror("错误", "请选择 Credit 或 Debit")
+            selected_sheet_type = current_sheet_type[0]
+            if selected_sheet_type not in ("credit", "debit"):
+                messagebox.showerror(
+                    "错误",
+                    "当前 Excel Sheet 无法自动识别为 Credit 或 Debit。\n"
+                    "请选择包含可识别月份/日期结构的 Sheet。"
+                )
                 return
 
             bank_name = bank_name_var.get().strip() or DEFAULT_BANK_NAME
             remove_items = parse_remove_items(remove_var.get())
             log_status(
                 f"正在处理... Excel Sheet: {selected_sheet} | 日期: {selected_month_display} | "
-                f"类型: {selected_account_type.title()}"
+                f"自动识别: {selected_sheet_type.title()}"
             )
 
             preprocessed_text = preprocess_statement_text(content, remove_items)
@@ -2871,15 +2986,16 @@ def run_parser_ui():
             rows = [(h.merchant, h.amount, h.who) for h in hits]
             summary_xlsx = get_summary_output_path(summary_var.get())
 
-            append_rows_to_selected_sheet(
+            detected_type = append_rows_to_selected_sheet(
                 summary_xlsx, selected_sheet, rows,
-                selected_month_index, selected_account_type,
+                selected_month_display, selected_period_position,
+                expected_sheet_type=selected_sheet_type,
                 bank_name=bank_name,
             )
 
             log_status(
                 f"已完成 / Completed | Excel Sheet: {selected_sheet} | 日期: {selected_month_display} | "
-                f"类型: {selected_account_type.title()} | 总表: {summary_xlsx.name}"
+                f"自动识别: {detected_type.title()} | 总表: {summary_xlsx.name}"
             )
             date_format_display = (
                 resolved_date_format if resolved_date_format
@@ -2890,7 +3006,7 @@ def run_parser_ui():
                 f"提取成功: {len(rows)} 笔交易\n"
                 f"当前Excel Sheet: {selected_sheet}\n"
                 f"当前日期: {selected_month_display}\n"
-                f"当前类型: {selected_account_type.title()}\n"
+                f"自动识别类型: {detected_type.title()}\n"
                 "写入方式: 保留原有数据并继续追加\n"
                 f"日期格式: {date_format_display}\n"
                 f"总表文件: {summary_xlsx.name}\n"
