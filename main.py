@@ -1923,6 +1923,40 @@ def create_debit_template_sheet(wb, expense_rows: List[Tuple[str, str]], month_l
     style_debit_summary_sheet(ws, total_row)
 
 
+
+def create_default_monthly_workbook(xlsx_path: Path, bank_name: str = DEFAULT_BANK_NAME):
+    """Create a brand-new default workbook with exactly two sheets.
+
+    Sheet 1: Credit Summary
+    Sheet 2: debit summary
+    Both use the standard Jan-Dec period labels and the existing formula/layout
+    conventions used by this program.
+    """
+    xlsx_path = Path(xlsx_path)
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+    # Remove openpyxl's automatic blank sheet so the workbook contains exactly
+    # the two program sheets requested by the user.
+    default_ws = wb.active
+    wb.remove(default_ws)
+
+    month_labels = list(DEFAULT_UI_MONTH_LABELS)
+    create_credit_template_sheet(
+        wb,
+        [CREDIT_DEFAULT_HEADER],
+        bank_name=(bank_name or DEFAULT_BANK_NAME).strip() or DEFAULT_BANK_NAME,
+        month_labels=month_labels,
+    )
+    create_debit_template_sheet(wb, [], month_labels)
+
+    # Explicitly enforce the requested order even if the helper implementations
+    # are changed later.
+    wb._sheets = [wb["Credit Summary"], wb[DEBIT_SHEET_NAME]]
+    wb.save(xlsx_path)
+    wb.close()
+    return xlsx_path
+
 def clear_credit_amounts_keep_layout(ws) -> int:
     """Clear historical Credit amounts in-place while preserving sheet name/layout."""
     header_row, header_map = find_credit_layout(ws)
@@ -2368,10 +2402,26 @@ def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: 
             f"Excel Sheet“{ws.title}”中的目标日期行已变化，请重新选择 Month 后再试。"
         )
     month_row = selected_period_row
-    if begin_col > 1:
-        bank_cell = ws.cell(row=max(1, header_row - 1), column=begin_col)
+
+    # Bank name may live inside a merged title range (for example A1:L1).
+    # A non-anchor MergedCell is read-only, so never assign to it directly.
+    # If a bank name was supplied, resolve the real top-left anchor of the
+    # merged range first. Existing non-empty titles are preserved.
+    if begin_col > 1 and str(bank_name or "").strip():
+        bank_row = max(1, header_row - 1)
+        bank_col = begin_col
+        anchor_row, anchor_col = bank_row, bank_col
+        for merged_range in ws.merged_cells.ranges:
+            if (
+                merged_range.min_row <= bank_row <= merged_range.max_row
+                and merged_range.min_col <= bank_col <= merged_range.max_col
+            ):
+                anchor_row, anchor_col = merged_range.min_row, merged_range.min_col
+                break
+        bank_cell = ws.cell(row=anchor_row, column=anchor_col)
         if bank_cell.value is None or str(bank_cell.value).strip() == "":
-            bank_cell.value = bank_name
+            bank_cell.value = str(bank_name).strip()
+
     merged = merge_same_merchants(rows)
     fixed = {CREDIT_BEGIN_HEADER, CREDIT_TOTAL_HEADER, CREDIT_DEBIT_HEADER, CREDIT_ENDING_HEADER}
     def refresh_map():
@@ -3019,10 +3069,7 @@ def run_parser_ui():
                 f"导入模式：{mode_name}\n"
                 f"导入Excel Sheet：{len(imported_sheet_names)} 个\n"
                 f"Excel Sheet名称：{', '.join(imported_sheet_names)}\n"
-                f"Credit 项目：{income_count}\n"
-                f"Debit Merchant：{expense_count}\n\n"
-                f"{result_note}\n"
-                f"UI 日期顺序：{', '.join(months)}"
+
             )
         except Exception as e:
             log_status(f"模板导入失败：{type(e).__name__}: {e}")
@@ -3093,10 +3140,6 @@ def run_parser_ui():
                 f"当前Excel Sheet: {selected_sheet}\n"
                 f"当前日期: {selected_month_display}\n"
                 f"自动识别类型: {detected_type.title()}\n"
-                "写入方式: 保留原有数据并继续追加\n"
-                f"日期格式: {date_format_display}\n"
-                f"总表文件: {summary_xlsx.name}\n"
-                f"分类规则文件: {category_rules_path()}\n"
             )
         except Exception as e:
             messagebox.showerror("异常 / Error", f"{type(e).__name__}: {e}")
@@ -3142,18 +3185,60 @@ def run_parser_ui():
             log_status(f"合并失败：{type(e).__name__}: {e}")
             messagebox.showerror("合并失败", f"{type(e).__name__}: {e}")
 
+    def create_default_excel():
+        try:
+            target = get_summary_output_path(summary_var.get())
+
+            if target.exists():
+                overwrite = messagebox.askyesno(
+                    "目标 Excel 已存在",
+                    f"目标文件已经存在：\n{target}\n\n"
+                    "生成默认表格会覆盖这个文件。是否继续？"
+                )
+                if not overwrite:
+                    return
+
+            log_status("正在生成默认 Excel（Credit + Debit，Jan-Dec）...")
+            create_default_monthly_workbook(
+                target,
+                bank_name=bank_name_var.get().strip() or DEFAULT_BANK_NAME,
+            )
+            summary_var.set(str(target))
+            refresh_sheet_and_month_options("Credit Summary")
+            log_status(
+                f"默认 Excel 已生成 | {target.name} | "
+                "2 个 Sheet | Jan-Dec"
+            )
+            messagebox.showinfo(
+                "生成完成",
+                f"默认 Excel 已生成：\n{target}\n\n"
+                "Sheet 1: Credit Summary\n"
+                "Sheet 2: debit summary\n"
+                "月份: Jan - Dec"
+            )
+        except PermissionError:
+            log_status("生成失败：Excel 文件可能正在打开")
+            messagebox.showerror(
+                "无法保存",
+                "目标 Excel 文件可能正在打开。请关闭 Excel 后再执行。"
+            )
+        except Exception as e:
+            log_status(f"生成默认 Excel 失败：{type(e).__name__}: {e}")
+            messagebox.showerror("生成失败", f"{type(e).__name__}: {e}")
+
     # ---------- 右上角按钮：按照界面布局放置 Start 和清空文本框 ----------
     mk_button(top_action_buttons, "Start", start).pack(side="left", padx=(0, 10))
     mk_button(top_action_buttons, "清空文本框", clear_textbox).pack(side="left")
 
-    # ---------- 底部按钮：导入按钮靠左，合并按钮靠右 ----------
-    footer = tk.Frame(root, bg=BG)
+    # ---------- 底部按钮：左侧导入、真正居中的默认表格、右侧合并 ----------
+    # 左右按钮组使用 pack；中间按钮使用 place(relx=0.5)，这样它的位置
+    # 永远以整个 footer 的几何中心为准，不会因为左侧按钮更宽而偏移。
+    footer = tk.Frame(root, bg=BG, height=44)
     footer.pack(fill="x", padx=10, pady=(6, 12))
-    footer.columnconfigure(0, weight=1)
-    footer.columnconfigure(1, weight=1)
+    footer.pack_propagate(False)
 
     import_buttons = tk.Frame(footer, bg=BG)
-    import_buttons.grid(row=0, column=0, sticky="w")
+    import_buttons.pack(side="left", anchor="w")
     mk_button(import_buttons, "导入并清空旧金额", lambda: import_existing_report(True)).pack(
         side="left", padx=(0, 8)
     )
@@ -3162,8 +3247,12 @@ def run_parser_ui():
     )
 
     merge_buttons = tk.Frame(footer, bg=BG)
-    merge_buttons.grid(row=0, column=1, sticky="e")
+    merge_buttons.pack(side="right", anchor="e")
     mk_button(merge_buttons, "合并当前 Sheet", merge_current_sheet).pack(side="right")
+
+    default_buttons = tk.Frame(footer, bg=BG)
+    default_buttons.place(relx=0.5, rely=0.5, anchor="center")
+    mk_button(default_buttons, "生成默认表格", create_default_excel).pack()
 
     root.mainloop()
 
