@@ -1666,6 +1666,10 @@ def looks_like_period_header(cell) -> bool:
 
     month_word = r"(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)"
     patterns = [
+        # Month + year, e.g. Apr-24 / April 2024.
+        rf"^{month_word}[-/\s]\d{{2,4}}$",
+        rf"^\d{{2,4}}[-/\s]{month_word}$",
+        # Day + month or month + day, optionally with year.
         rf"^\d{{1,2}}[-/\s]{month_word}(?:[-/\s]\d{{2,4}})?$",
         rf"^{month_word}[-/\s]\d{{1,2}}(?:[-/\s]\d{{2,4}})?$",
         r"^\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?$",
@@ -2125,16 +2129,17 @@ def import_existing_report_template(
             # Month/period labels must come from a real recognized layout.
             # Prefer Credit/Income because its period labels are authoritative;
             # only fall back to Debit/Expense if no Credit sheet is available.
+            # Month/type detection uses one rule everywhere:
+            # Column A has a month/date period => Credit; all other sheets => Debit.
             for candidate_ws in list(wb.worksheets):
-                credit_header_row, _ = find_credit_layout(candidate_ws)
-                if credit_header_row is not None:
-                    labels = extract_month_labels_from_income_sheet(candidate_ws)
-                    if labels:
-                        month_labels = list(labels)
-                        break
+                credit_options = get_credit_period_options_from_column_a(candidate_ws)
+                if credit_options:
+                    month_labels = [label for label, _ in credit_options]
+                    break
             if not month_labels:
                 for candidate_ws in list(wb.worksheets):
-                    if find_debit_layout(candidate_ws) is not None:
+                    debit_layout = find_debit_layout(candidate_ws)
+                    if debit_layout is not None:
                         labels = extract_month_labels_from_sheet(candidate_ws)
                         if labels:
                             month_labels = list(labels)
@@ -2142,23 +2147,23 @@ def import_existing_report_template(
 
             # 注意：这里只读取/修改工作表内容，绝不 remove/create/rename worksheet。
             for ws in list(wb.worksheets):
-                header_row, _ = find_credit_layout(ws)
-                if header_row is not None:
+                if is_credit_sheet_by_column_a(ws):
                     if clear_existing_data:
                         credit_item_count += clear_credit_amounts_keep_layout(ws)
                     else:
-                        # 完整保留模式只统计可识别的 Credit 项目，不改变任何单元格。
+                        # 类型由 Column A 决定；Credit 具体列仍由 Credit layout 定位。
                         layout = find_credit_layout(ws)
                         if layout[0] is not None:
                             credit_item_count += max(0, len(layout[1]))
                     continue
 
+                # All non-Credit sheets are classified as Debit.  Only recognizable
+                # Debit layouts are modified/counted; Cover/Notes sheets remain untouched.
                 debit_layout = find_debit_layout(ws)
                 if debit_layout is not None:
                     if clear_existing_data:
                         debit_merchant_count += clear_debit_amounts_keep_layout(ws)
                     else:
-                        # 完整保留模式只统计 Merchant，不改变任何单元格。
                         header_row_d, merchant_col, _, _, _ = debit_layout
                         for row in range(header_row_d + 1, ws.max_row + 1):
                             merchant = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
@@ -2221,40 +2226,68 @@ def list_workbook_sheet_names(path: Path) -> List[str]:
         wb.close()
 
 
-def get_period_options_from_ws(ws) -> Tuple[str, List[Tuple[str, int]]]:
-    """Auto-detect sheet type and return [(display_label, real_row_or_col), ...].
+def get_credit_period_options_from_column_a(ws) -> List[Tuple[str, int]]:
+    """Return Credit Month options found specifically in worksheet Column A.
 
-    Credit options store the real Excel row number.
-    Debit options store the real Excel column number.
-    This keeps the UI linked to the exact worksheet position instead of relying
-    on a separately reconstructed month index.
+    New program rule: a worksheet is Credit only when Column A contains more than
+    5 recognizable month/date/period values.  The returned position is the real row
+    number so the UI Month stays directly linked to the Credit target row.
+
+    Direct-reference formulas are supported through ``display_cell_text`` /
+    ``looks_like_period_header``; for example ``='CHASE #3444'!A3`` can resolve
+    to ``Apr-24`` while the writable target remains the current worksheet row.
     """
-    credit_header_row, credit_map = find_credit_layout(ws)
-    if credit_header_row is not None:
-        begin_col = credit_map[CREDIT_BEGIN_HEADER]
-        period_rows, _ = find_credit_period_rows(ws, credit_header_row, begin_col)
-        options: List[Tuple[str, int]] = []
-        if begin_col > 1:
-            for row in period_rows:
-                label = display_cell_text(ws.cell(row=row, column=begin_col - 1)).strip()
-                if label:
-                    options.append((label, row))
-        if options:
-            return "credit", options
+    options: List[Tuple[str, int]] = []
+    for row in range(1, ws.max_row + 1):
+        cell = ws.cell(row=row, column=1)
+        if not looks_like_period_header(cell):
+            continue
+        label = display_cell_text(cell).strip()
+        if label:
+            options.append((label, row))
+    return options
 
+
+def is_credit_sheet_by_column_a(ws) -> bool:
+    """Credit only when Column A contains more than 5 recognizable periods."""
+    return len(get_credit_period_options_from_column_a(ws)) > 5
+
+
+def classify_sheet_type(ws) -> str:
+    """Column A has >5 Month/date periods => Credit; otherwise Debit."""
+    return "credit" if is_credit_sheet_by_column_a(ws) else "debit"
+
+
+def get_period_options_from_ws(ws) -> Tuple[str, List[Tuple[str, int]]]:
+    """Classify by Column A and return Month UI options with real positions.
+
+    Credit:
+      - The ONLY type-detection rule is whether Column A contains more than 5 month/date values.
+      - Month options come directly from Column A.
+      - Position = real Excel row number.
+
+    Debit:
+      - Every sheet that fails the Column-A Credit rule is classified as Debit.
+      - Writable Month columns are still located from the Debit table layout.
+      - Position = real Excel column number.
+    """
+    credit_options = get_credit_period_options_from_column_a(ws)
+    if credit_options:
+        return "credit", credit_options
+
+    # Per the new rule, every non-Credit sheet is Debit.  It may still have no
+    # writable Debit layout (e.g. a Cover sheet), in which case options stay empty.
     debit_layout = find_debit_layout(ws)
-    if debit_layout is not None:
-        header_row, _, month_cols, _, _ = debit_layout
-        options = []
-        for col in month_cols:
-            label = display_cell_text(ws.cell(row=header_row, column=col)).strip()
-            if label:
-                options.append((label, col))
-        if options:
-            return "debit", options
+    if debit_layout is None:
+        return "debit", []
 
-    return "", []
-
+    header_row, _, month_cols, _, _ = debit_layout
+    options: List[Tuple[str, int]] = []
+    for col in month_cols:
+        label = display_cell_text(ws.cell(row=header_row, column=col)).strip()
+        if label:
+            options.append((label, col))
+    return "debit", options
 
 def read_period_options_from_selected_sheet(path: Path, sheet_name: str) -> Tuple[str, List[Tuple[str, int]]]:
     path = Path(path)
@@ -3069,7 +3102,10 @@ def run_parser_ui():
                 f"导入模式：{mode_name}\n"
                 f"导入Excel Sheet：{len(imported_sheet_names)} 个\n"
                 f"Excel Sheet名称：{', '.join(imported_sheet_names)}\n"
-
+                f"Credit 项目：{income_count}\n"
+                f"Debit Merchant：{expense_count}\n\n"
+                f"{result_note}\n"
+                f"UI 日期顺序：{', '.join(months)}"
             )
         except Exception as e:
             log_status(f"模板导入失败：{type(e).__name__}: {e}")
@@ -3140,6 +3176,10 @@ def run_parser_ui():
                 f"当前Excel Sheet: {selected_sheet}\n"
                 f"当前日期: {selected_month_display}\n"
                 f"自动识别类型: {detected_type.title()}\n"
+                "写入方式: 保留原有数据并继续追加\n"
+                f"日期格式: {date_format_display}\n"
+                f"总表文件: {summary_xlsx.name}\n"
+                f"分类规则文件: {category_rules_path()}\n"
             )
         except Exception as e:
             messagebox.showerror("异常 / Error", f"{type(e).__name__}: {e}")
