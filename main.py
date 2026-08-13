@@ -1,6 +1,7 @@
 import re
 import csv
 import sys
+from difflib import SequenceMatcher
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -290,6 +291,44 @@ CREDIT_DEBIT_HEADER = "DEBIT"
 CREDIT_ENDING_HEADER = "ENDING BALANCE"
 CREDIT_BEGIN_HEADER = "BEGIN BALANCE"
 DEFAULT_BANK_NAME = ""
+
+# ================= Excel position constants / runtime cache =================
+# Credit type rule requires Month labels in Column A, therefore the fixed
+# Beginning Balance column is the column immediately to the right: Column B.
+CREDIT_MONTH_COL = 1
+CREDIT_BEGIN_COL = 2
+
+# Debit columns do not move when transactions are added.  Detect each Debit
+# sheet once per workbook path during the current program session, then reuse
+# the numeric coordinates directly instead of rescanning the worksheet.
+DEBIT_LAYOUT_CACHE: Dict[Tuple[str, str], Tuple[int, int, Tuple[int, ...], int, Optional[int]]] = {}
+
+def _debit_cache_key(path: Path, sheet_name: str) -> Tuple[str, str]:
+    return (str(Path(path).expanduser().resolve()).casefold(), str(sheet_name))
+
+def clear_debit_layout_cache(path: Optional[Path] = None):
+    if path is None:
+        DEBIT_LAYOUT_CACHE.clear()
+        return
+    target = str(Path(path).expanduser().resolve()).casefold()
+    for key in list(DEBIT_LAYOUT_CACHE):
+        if key[0] == target:
+            DEBIT_LAYOUT_CACHE.pop(key, None)
+
+def cache_debit_layout(path: Path, sheet_name: str, layout):
+    if layout is None:
+        return None
+    header_row, merchant_col, month_cols, total_col, category_col = layout
+    frozen = (header_row, merchant_col, tuple(month_cols), total_col, category_col)
+    DEBIT_LAYOUT_CACHE[_debit_cache_key(path, sheet_name)] = frozen
+    return frozen
+
+def get_cached_debit_layout(path: Path, sheet_name: str):
+    cached = DEBIT_LAYOUT_CACHE.get(_debit_cache_key(path, sheet_name))
+    if cached is None:
+        return None
+    header_row, merchant_col, month_cols, total_col, category_col = cached
+    return header_row, merchant_col, list(month_cols), total_col, category_col
 
 CREDIT_MONTH_ROWS = {
     "JAN": 3,
@@ -592,6 +631,127 @@ def get_category_for_merchant(merchant: str, rules: List[Tuple[str, str]]) -> st
 
     return ""
 
+
+# ================= Smart Category Learning =================
+
+CATEGORY_REVIEW_LABEL = "REVIEW"
+CATEGORY_FUZZY_THRESHOLD = 0.86
+CATEGORY_FUZZY_MARGIN = 0.03
+
+def collect_category_history_from_workbook(wb) -> Dict[str, str]:
+    """Collect normalized Merchant -> Category from existing workbook sheets.
+
+    Only non-empty, human-confirmed categories are learned. REVIEW / UNCLASSIFIED
+    are deliberately ignored so uncertain guesses never become training data.
+    If the same normalized merchant has conflicting categories, the most frequent
+    category wins; ties keep the first category encountered.
+    """
+    counts: Dict[str, OrderedDict] = {}
+
+    for ws in wb.worksheets:
+        # Category learning follows the same Debit-layout detection used by the UI.
+        # This also supports sheets whose A1 contains a bank name instead of the
+        # literal word Merchant.
+        layout = find_debit_layout(ws)
+        if layout is None:
+            continue
+        header_row, merchant_col, _, _, category_col = layout
+        if category_col is None:
+            continue
+
+        for row in range(header_row + 1, ws.max_row + 1):
+            merchant = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+            category = normalized_cell_text(ws.cell(row=row, column=category_col).value)
+
+            if not merchant or merchant.upper() in {"TOTAL", "GRAND TOTAL"}:
+                continue
+            if not category or category.upper() in {"REVIEW", "UNCLASSIFIED", "UNKNOWN"}:
+                continue
+
+            norm = normalize_merchant_for_category(merchant)
+            if not norm:
+                continue
+
+            bucket = counts.setdefault(norm, OrderedDict())
+            bucket[category] = bucket.get(category, 0) + 1
+
+    history: Dict[str, str] = {}
+    for norm, bucket in counts.items():
+        best_category = max(bucket.items(), key=lambda item: item[1])[0]
+        history[norm] = best_category
+    return history
+
+def merchant_similarity(a: str, b: str) -> float:
+    """Conservative similarity score for two normalized merchant names."""
+    a = normalize_merchant_for_category(a)
+    b = normalize_merchant_for_category(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+
+    seq = SequenceMatcher(None, a, b).ratio()
+    ta, tb = set(a.split()), set(b.split())
+    union = ta | tb
+    jaccard = (len(ta & tb) / len(union)) if union else 0.0
+    score = max(seq, 0.70 * seq + 0.30 * jaccard)
+
+    # Strong brand-prefix/containment signal, but only for meaningful names.
+    if min(len(a), len(b)) >= 4 and (a in b or b in a):
+        score = max(score, 0.94)
+    return score
+
+def get_smart_category_for_merchant(
+    merchant: str,
+    rules: List[Tuple[str, str]],
+    history: Optional[Dict[str, str]] = None,
+    fallback: str = CATEGORY_REVIEW_LABEL,
+) -> Tuple[str, str, float]:
+    """Return (category, source, confidence).
+
+    Priority:
+      1) exact normalized match in workbook history
+      2) category_rules.xlsx exact/keyword match
+      3) conservative fuzzy match against workbook history
+      4) REVIEW
+    """
+    norm = normalize_merchant_for_category(merchant)
+    history = history or {}
+    if not norm:
+        return fallback, "review", 0.0
+
+    if norm in history:
+        return history[norm], "history-exact", 1.0
+
+    rule_category = get_category_for_merchant(merchant, rules)
+    if rule_category:
+        return rule_category, "rule", 1.0
+
+    best_norm = ""
+    best_category = ""
+    best_score = 0.0
+    second_score = 0.0
+
+    for hist_norm, category in history.items():
+        score = merchant_similarity(norm, hist_norm)
+        if score > best_score:
+            second_score = best_score
+            best_score = score
+            best_norm = hist_norm
+            best_category = category
+        elif score > second_score:
+            second_score = score
+
+    # Do not auto-classify an ambiguous fuzzy match.
+    if (
+        best_category
+        and best_score >= CATEGORY_FUZZY_THRESHOLD
+        and (best_score - second_score >= CATEGORY_FUZZY_MARGIN or best_score >= 0.94)
+    ):
+        return best_category, f"history-fuzzy:{best_norm}", best_score
+
+    return fallback, "review", best_score
+
 # ================= 预处理删除内容 =================
 
 def parse_remove_items(raw: str) -> List[str]:
@@ -834,6 +994,7 @@ def merge_same_merchants(rows):
 def write_merged_xlsx(xlsx_path: Path, rows):
     merged = merge_same_merchants(rows)
     rules = load_category_rules()
+    category_history = collect_category_history_from_workbook(wb)
 
     wb = Workbook()
     ws = wb.active
@@ -1195,7 +1356,9 @@ def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui
     for merchant in merchants_sorted:
         category = existing_categories.get(merchant, "")
         if not category:
-            category = get_category_for_merchant(merchant, rules)
+            category, _, _ = get_smart_category_for_merchant(
+                merchant, rules, category_history
+            )
 
         ws.cell(row=row_idx, column=1, value=merchant)
 
@@ -1447,14 +1610,13 @@ def find_column_by_header(ws, header_row: int, aliases: List[str]) -> Optional[i
 
 
 def extract_expense_template_from_sheet(ws) -> List[Tuple[str, str]]:
-    """Extract only Merchant and Category; all historical amounts are ignored."""
-    header_row = find_header_row(ws, ["Merchant", "Category"])
-    if header_row is None:
+    """Extract Merchant/Category from any recognized Debit layout."""
+    layout = find_debit_layout(ws)
+    if layout is None:
         return []
 
-    merchant_col = find_column_by_header(ws, header_row, ["Merchant", "Vendor", "Description"])
-    category_col = find_column_by_header(ws, header_row, ["Category", "Class"])
-    if merchant_col is None or category_col is None:
+    header_row, merchant_col, _, _, category_col = layout
+    if category_col is None:
         return []
 
     rows: List[Tuple[str, str]] = []
@@ -1466,7 +1628,9 @@ def extract_expense_template_from_sheet(ws) -> List[Tuple[str, str]]:
 
         if not merchant:
             continue
-        if merchant.upper() in {"TOTAL", "GRAND TOTAL"}:
+        if merchant.upper() in {"TOTAL", "GRAND TOTAL", "BEGIN", "ADD", "LESS", "ENDING", "ENDING`"}:
+            if merchant.upper() in {"TOTAL", "GRAND TOTAL"}:
+                break
             continue
 
         key = merchant.casefold()
@@ -1685,34 +1849,26 @@ def build_sum_formula_for_columns(ws, row: int, columns: List[int]) -> str:
 
 
 def extract_month_labels_from_sheet(ws) -> List[str]:
-    """Read every horizontal period/date header from a Merchant-style sheet.
+    """Read horizontal Debit period/date labels from the detected Debit layout.
 
-    Period columns are all columns between Merchant and Total (or Category).
-    This intentionally supports more than 12 periods, for example an extra
-    ``31-Jul`` column after the normal monthly columns.
+    This deliberately does not require a literal ``Merchant`` header.  It uses
+    ``find_debit_layout`` so UI Month detection, import, clearing and writing all
+    share the exact same Debit-layout rules.
     """
-    header_row = find_header_row(ws, ["Merchant"])
-    if header_row is None:
-        return []
-    merchant_col = find_column_by_header(ws, header_row, ["Merchant", "Vendor", "Description"])
-    if merchant_col is None:
+    layout = find_debit_layout(ws)
+    if layout is None:
         return []
 
-    total_col = find_column_by_header(ws, header_row, ["Total", "Amount Total", "Grand Total"])
-    category_col = find_column_by_header(ws, header_row, ["Category", "Class"])
-
-    candidates: List[str] = []
-    for col in range(merchant_col + 1, ws.max_column + 1):
-        if col in {total_col, category_col}:
-            continue
+    header_row, _, month_cols, _, _ = layout
+    labels: List[str] = []
+    for col in month_cols:
         cell = ws.cell(row=header_row, column=col)
-        # Columns before Total remain compatible with the original layout.
-        # Columns after Category/Total are included only when they look like dates.
-        if (total_col is not None and col < total_col) or looks_like_period_header(cell):
-            text = display_cell_text(cell)
-            if text:
-                candidates.append(text)
-    return candidates
+        if not looks_like_period_header(cell):
+            continue
+        text = display_cell_text(cell).strip()
+        if text:
+            labels.append(text)
+    return labels
 
 
 def find_credit_period_rows(ws, header_row: int, begin_col: int) -> Tuple[List[int], Optional[int]]:
@@ -1962,8 +2118,12 @@ def create_default_monthly_workbook(xlsx_path: Path, bank_name: str = DEFAULT_BA
     return xlsx_path
 
 def clear_credit_amounts_keep_layout(ws) -> int:
-    """Clear historical Credit amounts in-place while preserving sheet name/layout."""
-    header_row, header_map = find_credit_layout(ws)
+    """Clear Credit amounts after the SINGLE Column-A type rule classifies the sheet."""
+    if not is_credit_sheet_by_column_a(ws):
+        return 0
+
+    # Layout lookup is positioning only; it never decides the sheet type.
+    header_row, header_map = locate_credit_columns(ws)
     if header_row is None:
         return 0
 
@@ -2133,7 +2293,10 @@ def import_existing_report_template(
             # Column A has a month/date period => Credit; all other sheets => Debit.
             for candidate_ws in list(wb.worksheets):
                 credit_options = get_credit_period_options_from_column_a(candidate_ws)
-                if credit_options:
+                # Insurance rule: only >5 recognizable Month/date values in Column A
+                # makes this a Credit sheet. 1~5 accidental dates must not steal
+                # the workbook's authoritative Month labels.
+                if len(credit_options) > 5:
                     month_labels = [label for label, _ in credit_options]
                     break
             if not month_labels:
@@ -2151,8 +2314,8 @@ def import_existing_report_template(
                     if clear_existing_data:
                         credit_item_count += clear_credit_amounts_keep_layout(ws)
                     else:
-                        # 类型由 Column A 决定；Credit 具体列仍由 Credit layout 定位。
-                        layout = find_credit_layout(ws)
+                        # 类型只由 Column A 决定；下面仅统计可定位到的 Credit 控制/收入列。
+                        layout = locate_credit_columns(ws)
                         if layout[0] is not None:
                             credit_item_count += max(0, len(layout[1]))
                     continue
@@ -2272,7 +2435,9 @@ def get_period_options_from_ws(ws) -> Tuple[str, List[Tuple[str, int]]]:
       - Position = real Excel column number.
     """
     credit_options = get_credit_period_options_from_column_a(ws)
-    if credit_options:
+    # IMPORTANT: keep the exact same classification rule used everywhere else.
+    # Column A must contain MORE THAN 5 recognizable Month/date values.
+    if len(credit_options) > 5:
         return "credit", credit_options
 
     # Per the new rule, every non-Credit sheet is Debit.  It may still have no
@@ -2297,7 +2462,29 @@ def read_period_options_from_selected_sheet(path: Path, sheet_name: str) -> Tupl
     try:
         if sheet_name not in wb.sheetnames:
             return "", []
-        return get_period_options_from_ws(wb[sheet_name])
+        ws = wb[sheet_name]
+
+        credit_options = get_credit_period_options_from_column_a(ws)
+        if len(credit_options) > 5:
+            return "credit", credit_options
+
+        # Debit: scan only the first time for this workbook+sheet, then preserve
+        # the numeric positions for the rest of the UI session.
+        layout = get_cached_debit_layout(path, sheet_name)
+        if layout is None:
+            layout = find_debit_layout(ws)
+            if layout is not None:
+                cache_debit_layout(path, sheet_name, layout)
+        if layout is None:
+            return "debit", []
+
+        header_row, _, month_cols, _, _ = layout
+        options = []
+        for col in month_cols:
+            label = display_cell_text(ws.cell(row=header_row, column=col)).strip()
+            if label:
+                options.append((label, col))
+        return "debit", options
     finally:
         wb.close()
 
@@ -2321,26 +2508,43 @@ def find_first_writable_sheet_name(path: Path, preferred_names: Optional[List[st
         wb.close()
 
 
-def resolve_period_position(ws, sheet_type: str, selected_label: str, selected_position: int) -> int:
-    """Validate the UI mapping before writing; recover by unique label if Excel changed."""
-    current_type, options = get_period_options_from_ws(ws)
-    if current_type != sheet_type:
-        raise ValueError(
-            f"Excel Sheet“{ws.title}”结构已变化，请重新选择该 Sheet 后再试。"
+def resolve_period_position(
+    ws, sheet_type: str, selected_label: str, selected_position: int,
+    xlsx_path: Optional[Path] = None, sheet_name: str = ""
+) -> int:
+    """Resolve UI target. Debit uses cached numeric columns; Credit stays dynamic."""
+    if sheet_type == "debit":
+        layout = (
+            get_cached_debit_layout(xlsx_path, sheet_name)
+            if xlsx_path is not None and sheet_name else None
         )
+        if layout is None:
+            layout = find_debit_layout(ws)
+            if layout is not None and xlsx_path is not None and sheet_name:
+                cache_debit_layout(xlsx_path, sheet_name, layout)
+        if layout is None:
+            raise ValueError(f"Excel Sheet“{ws.title}”没有可用的 Debit 固定列映射。")
+        header_row, _, month_cols, _, _ = layout
+        if selected_position not in month_cols:
+            raise ValueError("当前 Month 对应的 Debit 固定列不存在，请重新选择 Sheet。")
+        # Column number is authoritative. Label is UI display only.
+        return selected_position
 
+    # Credit columns can move as merchants are inserted, but Month rows in A are
+    # stable. Re-read Column A and recover by label if necessary.
+    options = get_credit_period_options_from_column_a(ws)
+    if len(options) <= 5:
+        raise ValueError(f"Excel Sheet“{ws.title}”已不符合 Credit 的 Column A 规则。")
     for label, position in options:
         if position == selected_position and label == selected_label:
             return position
-
-    label_matches = [position for label, position in options if label == selected_label]
-    if len(label_matches) == 1:
-        return label_matches[0]
-
+    matches = [position for label, position in options if label == selected_label]
+    if len(matches) == 1:
+        return matches[0]
     raise ValueError(
-        f"日期/期间“{selected_label}”与当前 Excel 位置不一致。"
-        "请重新选择 Excel Sheet 和 Month 后再试。"
+        f"日期/期间“{selected_label}”与当前 Excel 位置不一致。请重新选择 Month。"
     )
+
 
 def append_amount_to_cell(cell, amounts: List[str]):
     parts = split_formula_parts(cell.value)
@@ -2388,46 +2592,211 @@ def copy_column_style(ws, source_col: int, target_col: int, max_row: int):
         dst.number_format = src.number_format
 
 
-def find_credit_layout(ws):
-    limit = min(ws.max_row, 100)
-    for row in range(1, limit + 1):
-        header_map = {}
-        for col in range(1, ws.max_column + 1):
-            key = normalized_header_key(ws.cell(row=row, column=col).value)
-            if key:
-                header_map[key] = col
-        required = {CREDIT_BEGIN_HEADER, CREDIT_TOTAL_HEADER, CREDIT_DEBIT_HEADER, CREDIT_ENDING_HEADER}
-        if required.issubset(header_map):
-            return row, header_map
-    return None, {}
+def locate_credit_columns(ws):
+    """Return Credit control-column positions using numeric structure only.
 
+    This function NEVER decides sheet type. Credit/Debit type is already fixed by
+    the single Column-A rule.  For Credit, positions follow one stable structure:
+
+        A = Month
+        B = Beginning Balance (fixed)
+        C.. = dynamic merchant/income columns
+        rightmost 3 non-empty header cells = Total Credit, Debit, Ending Balance
+
+    Merchant columns may grow, so only the three right-edge control columns are
+    recalculated. No old header-text validation is used here.
+    """
+    credit_options = get_credit_period_options_from_column_a(ws)
+    if len(credit_options) <= 5:
+        return None, {}
+
+    first_period_row = min(row for _, row in credit_options)
+    header_row = first_period_row - 1
+    if header_row < 1:
+        return None, {}
+
+    begin_col = CREDIT_BEGIN_COL
+    col_limit = min(ws.max_column, 500)
+
+    # Dynamic Credit additions happen before the three control columns.  The
+    # rightmost three non-empty cells on the header row therefore remain the
+    # numeric anchors for Total Credit / Debit / Ending Balance.
+    used_header_cols = []
+    for col in range(begin_col, col_limit + 1):
+        value = ws.cell(row=header_row, column=col).value
+        if value is not None and str(value).strip() != "":
+            used_header_cols.append(col)
+
+    if len(used_header_cols) < 4:
+        return None, {}
+
+    total_credit_col, debit_col, ending_col = used_header_cols[-3:]
+    if not (begin_col < total_credit_col < debit_col < ending_col):
+        return None, {}
+
+    # Keep raw merchant names for existing-column lookup, then overlay canonical
+    # control keys at their numeric positions.
+    header_map = {}
+    for col in used_header_cols:
+        key = normalized_header_key(ws.cell(row=header_row, column=col).value)
+        if key:
+            header_map[key] = col
+
+    header_map[CREDIT_BEGIN_HEADER] = begin_col
+    header_map[CREDIT_TOTAL_HEADER] = total_credit_col
+    header_map[CREDIT_DEBIT_HEADER] = debit_col
+    header_map[CREDIT_ENDING_HEADER] = ending_col
+    return header_row, header_map
 
 def find_debit_layout(ws):
-    header_row = find_header_row(ws, ["Merchant"])
+    """Locate a horizontal Debit table, with or without a Merchant header.
+
+    Sheet TYPE is still decided elsewhere by the Column-A Credit rule:
+    Column A must contain >5 recognizable Month/date values to be Credit;
+    every other sheet is treated as a Debit candidate.
+
+    Supported Debit layouts now include both of these forms::
+
+        Merchant | Apr-25 | May-25 | ... | Total | Category | 6-Aug
+
+    and headerless-Merchant layouts such as::
+
+        Bank #234242 | Apr-25 | May-25 | ... | Total | Category | 6-Aug
+        merchant 1   |        |        | ...
+        merchant 2   |        |        | ...
+
+    In the second form, the row containing the horizontal period headers is the
+    header row, and the column immediately left of the first period is treated as
+    the Merchant column.  Detection is bounded so an accidentally huge Excel Used
+    Range cannot freeze the Tkinter UI.
+    """
+    MAX_DEBIT_SCAN_ROWS = 50
+    MAX_DEBIT_SCAN_COLS = 200
+    MIN_FALLBACK_PERIOD_HEADERS = 2
+
+    row_limit = min(ws.max_row, MAX_DEBIT_SCAN_ROWS)
+    col_limit = min(ws.max_column, MAX_DEBIT_SCAN_COLS)
+
+    merchant_aliases = {"MERCHANT", "VENDOR", "DESCRIPTION"}
+    total_aliases = {"TOTAL", "AMOUNT TOTAL", "GRAND TOTAL"}
+    category_aliases = {"CATEGORY", "CLASS"}
+
+    # ---------- 1) Prefer the classic explicit Merchant-header layout ----------
+    header_row = None
+    merchant_col = None
+    for row in range(1, row_limit + 1):
+        for col in range(1, col_limit + 1):
+            key = normalized_header_key(ws.cell(row=row, column=col).value)
+            if key in merchant_aliases:
+                header_row = row
+                merchant_col = col
+                break
+        if header_row is not None:
+            break
+
+    # ---------- 2) Fallback: infer the header row from horizontal Month cells ----------
     if header_row is None:
+        best = None  # (score, row, first_period_col, period_cols, total_col, category_col)
+
+        for row in range(1, row_limit + 1):
+            period_cols_on_row = []
+            total_col_on_row = None
+            category_col_on_row = None
+
+            for col in range(1, col_limit + 1):
+                cell = ws.cell(row=row, column=col)
+                key = normalized_header_key(cell.value)
+
+                if total_col_on_row is None and key in total_aliases:
+                    total_col_on_row = col
+                if category_col_on_row is None and key in category_aliases:
+                    category_col_on_row = col
+                if looks_like_period_header(cell):
+                    period_cols_on_row.append(col)
+
+            if len(period_cols_on_row) < MIN_FALLBACK_PERIOD_HEADERS:
+                continue
+
+            # A real Debit header normally has Total; Category is an additional signal.
+            # Requiring Total prevents ordinary data rows containing a few dates from
+            # being mistaken for the table header.
+            if total_col_on_row is None:
+                continue
+
+            first_period_col = min(period_cols_on_row)
+            inferred_merchant_col = first_period_col - 1
+            if inferred_merchant_col < 1:
+                continue
+
+            score = len(period_cols_on_row) + (2 if category_col_on_row else 0)
+            candidate = (
+                score, row, inferred_merchant_col,
+                period_cols_on_row, total_col_on_row, category_col_on_row,
+            )
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+
+        if best is None:
+            return None
+
+        _, header_row, merchant_col, detected_period_cols, total_col, category_col = best
+
+        # Keep the traditional monthly block between Merchant and Total, including
+        # intentionally blank month columns. Extra period columns after Total/Category
+        # are added below only when they actually look like dates.
+        month_cols = list(range(merchant_col + 1, total_col))
+        for col in detected_period_cols:
+            if col > total_col and col != category_col:
+                month_cols.append(col)
+
+        month_cols = sorted(set(month_cols))
+        return header_row, merchant_col, month_cols, total_col, category_col
+
+    # ---------- 3) Classic layout: locate Total/Category on the same row ----------
+    total_col = None
+    category_col = None
+    for col in range(1, col_limit + 1):
+        key = normalized_header_key(ws.cell(row=header_row, column=col).value)
+        if total_col is None and key in total_aliases:
+            total_col = col
+        if category_col is None and key in category_aliases:
+            category_col = col
+
+    if total_col is None:
         return None
-    merchant_col = find_column_by_header(ws, header_row, ["Merchant", "Vendor", "Description"])
-    total_col = find_column_by_header(ws, header_row, ["Total", "Amount Total", "Grand Total"])
-    category_col = find_column_by_header(ws, header_row, ["Category", "Class"])
-    if merchant_col is None or total_col is None:
-        return None
-    # Standard period columns are between Merchant and Total. In addition,
-    # date-like headers anywhere after Total/Category are also writable periods.
+
     month_cols = list(range(merchant_col + 1, total_col))
-    for col in range(total_col + 1, ws.max_column + 1):
+
+    # Preserve support for extra date/month columns after Total or Category.
+    for col in range(total_col + 1, col_limit + 1):
         if col == category_col:
             continue
         if looks_like_period_header(ws.cell(row=header_row, column=col)):
             month_cols.append(col)
+
+    month_cols = sorted(set(month_cols))
     if not month_cols:
         return None
+
     return header_row, merchant_col, month_cols, total_col, category_col
 
 
 def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: str = DEFAULT_BANK_NAME):
-    header_row, header_map = find_credit_layout(ws)
+    # SINGLE TYPE RULE: Column A > 5 recognizable Month/date values => Credit.
+    # No header/layout rule is allowed to reclassify or reject the sheet type.
+    if not is_credit_sheet_by_column_a(ws):
+        raise ValueError(
+            f"Excel Sheet“{ws.title}”按 Column A 月份数量规则判定为 Debit，不能执行 Credit 写入。"
+        )
+
+    # From this point on the sheet is already Credit.  This helper ONLY locates
+    # control columns; it does not validate the Credit/Debit type.
+    header_row, header_map = locate_credit_columns(ws)
     if header_row is None:
-        raise ValueError(f"Excel Sheet“{ws.title}”不是可识别的 Credit 格式。")
+        raise ValueError(
+            f"Excel Sheet“{ws.title}”已按 Column A 规则判定为 Credit，"
+            "但程序无法定位 Credit 的控制列（Begin / Total / Debit / Ending）。"
+        )
     begin_col = header_map[CREDIT_BEGIN_HEADER]
     period_rows, total_row = find_credit_period_rows(ws, header_row, begin_col)
     if selected_period_row not in period_rows:
@@ -2458,9 +2827,20 @@ def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: 
     merged = merge_same_merchants(rows)
     fixed = {CREDIT_BEGIN_HEADER, CREDIT_TOTAL_HEADER, CREDIT_DEBIT_HEADER, CREDIT_ENDING_HEADER}
     def refresh_map():
-        return {normalized_header_key(ws.cell(row=header_row, column=c).value): c
-                for c in range(1, ws.max_column + 1)
-                if normalized_header_key(ws.cell(row=header_row, column=c).value)}
+        # Keep original merchant/header names, but always overlay the canonical
+        # Credit control-column keys returned by the flexible locator.  This is
+        # important when the workbook says e.g. "Beginning Balance" instead of
+        # the exact text "BEGIN BALANCE".
+        raw = {
+            normalized_header_key(ws.cell(row=header_row, column=c).value): c
+            for c in range(1, min(ws.max_column, 200) + 1)
+            if normalized_header_key(ws.cell(row=header_row, column=c).value)
+        }
+        # Position refresh only. Sheet type was already fixed by the Column-A rule.
+        detected_header_row, canonical = locate_credit_columns(ws)
+        if detected_header_row == header_row:
+            raw.update(canonical)
+        return raw
     for merchant, data in merged.items():
         target_header = classify_credit_column(merchant)
         current_map = refresh_map()
@@ -2504,8 +2884,11 @@ def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: 
     ws.cell(total_row, ending_col, f"={ws.cell(last_data_row, ending_col).coordinate}")
 
 
-def update_debit_sheet_in_place(ws, rows, selected_period_col: int):
-    layout = find_debit_layout(ws)
+def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None):
+    # UI/writer passes the cached numeric Debit layout.  Only fall back to one
+    # scan when this function is called independently.
+    if layout is None:
+        layout = find_debit_layout(ws)
     if layout is None:
         raise ValueError(f"Excel Sheet“{ws.title}”不是可识别的 Debit 格式。")
     header_row, merchant_col, month_cols, total_col, category_col = layout
@@ -2515,6 +2898,7 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int):
         )
     selected_col = selected_period_col
     rules = load_category_rules()
+    category_history = collect_category_history_from_workbook(ws.parent)
     merged = merge_same_merchants(rows)
     total_row = None
     merchant_rows = {}
@@ -2526,6 +2910,18 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int):
             total_row = r
             break
         merchant_rows[name.casefold()] = r
+
+        # Fill only blank categories; never overwrite a user's existing choice.
+        if category_col is not None:
+            category_cell = ws.cell(r, category_col)
+            existing_category = normalized_cell_text(category_cell.value)
+            if not existing_category:
+                learned_category, _, _ = get_smart_category_for_merchant(
+                    name, rules, category_history
+                )
+                category_cell.value = learned_category
+                if learned_category.upper() != CATEGORY_REVIEW_LABEL:
+                    category_history[normalize_merchant_for_category(name)] = learned_category
     if total_row is None:
         total_row = ws.max_row + 1
         ws.cell(total_row, merchant_col, "Total")
@@ -2540,7 +2936,12 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int):
             for c in month_cols:
                 ws.cell(r, c, None)
             if category_col is not None:
-                ws.cell(r, category_col, get_category_for_merchant(merchant, rules))
+                learned_category, _, _ = get_smart_category_for_merchant(
+                    merchant, rules, category_history
+                )
+                ws.cell(r, category_col, learned_category)
+                if learned_category.upper() != CATEGORY_REVIEW_LABEL:
+                    category_history[normalize_merchant_for_category(merchant)] = learned_category
             merchant_rows[merchant.casefold()] = r
         append_amount_to_cell(ws.cell(r, selected_col), data["amounts"])
         ws.cell(r, total_col, build_sum_formula_for_columns(ws, r, month_cols))
@@ -2568,22 +2969,29 @@ def append_rows_to_selected_sheet(
             raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
         ws = wb[sheet_name]
 
-        detected_type, options = get_period_options_from_ws(ws)
-        if not detected_type or not options:
-            raise ValueError(f"Excel Sheet“{sheet_name}”不是可识别的 Credit 或 Debit 格式。")
+        # SINGLE type rule only. No header-based reclassification.
+        detected_type = "credit" if is_credit_sheet_by_column_a(ws) else "debit"
         if expected_sheet_type and detected_type != expected_sheet_type:
-            raise ValueError(
-                f"Excel Sheet“{sheet_name}”结构已变化，请重新选择 Sheet 后再试。"
-            )
+            raise ValueError(f"Excel Sheet“{sheet_name}”类型已变化，请重新选择 Sheet 后再试。")
+
+        debit_layout = None
+        if detected_type == "debit":
+            debit_layout = get_cached_debit_layout(xlsx_path, sheet_name)
+            if debit_layout is None:
+                debit_layout = find_debit_layout(ws)
+                if debit_layout is None:
+                    raise ValueError(f"Excel Sheet“{sheet_name}”没有可用的 Debit 固定列映射。")
+                cache_debit_layout(xlsx_path, sheet_name, debit_layout)
 
         real_position = resolve_period_position(
-            ws, detected_type, selected_period_label, selected_period_position
+            ws, detected_type, selected_period_label, selected_period_position,
+            xlsx_path=xlsx_path, sheet_name=sheet_name
         )
 
         if detected_type == "credit":
             update_credit_sheet_in_place(ws, rows, real_position, bank_name)
         else:
-            update_debit_sheet_in_place(ws, rows, real_position)
+            update_debit_sheet_in_place(ws, rows, real_position, layout=debit_layout)
         wb.save(xlsx_path)
         return detected_type
     finally:
@@ -2629,35 +3037,11 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
             raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
 
         ws = wb[sheet_name]
-        header_row = find_header_row(ws, ["Merchant"])
-        if header_row is None:
-            raise ValueError("当前Excel Sheet中找不到 Merchant 表头。")
+        layout = find_debit_layout(ws)
+        if layout is None:
+            raise ValueError("当前Excel Sheet中找不到可识别的 Debit 月份表格。")
 
-        merchant_col = find_column_by_header(
-            ws, header_row, ["Merchant", "Vendor", "Description"]
-        )
-        total_col = find_column_by_header(
-            ws, header_row, ["Total", "Amount Total", "Grand Total"]
-        )
-        category_col = find_column_by_header(
-            ws, header_row, ["Category", "Class"]
-        )
-        if merchant_col is None:
-            raise ValueError("当前Excel Sheet中找不到 Merchant 列。")
-        if total_col is None:
-            raise ValueError("当前Excel Sheet中找不到 Total 列。")
-
-        # 1) Merchant 与 Total 之间的所有列。
-        period_cols = list(range(merchant_col + 1, total_col))
-
-        # 2) Total/Category 后面继续出现的月份或日期列，例如 6-Aug。
-        # 必须在读取明细和删除行之前确定并保存这些列。
-        for col in range(total_col + 1, ws.max_column + 1):
-            if col == category_col:
-                continue
-            if looks_like_period_header(ws.cell(row=header_row, column=col)):
-                period_cols.append(col)
-
+        header_row, merchant_col, period_cols, total_col, category_col = layout
         period_cols = sorted(set(period_cols))
         if not period_cols:
             raise ValueError("当前Excel Sheet中找不到可合并的月份或日期列。")
@@ -3083,6 +3467,7 @@ def run_parser_ui():
                 clear_existing_data=clear_existing_data,
             )
             summary_var.set(str(target))
+            clear_debit_layout_cache(target)
             first_writable_sheet = find_first_writable_sheet_name(target, imported_sheet_names)
             refresh_sheet_and_month_options(first_writable_sheet)
             log_status(
@@ -3244,6 +3629,7 @@ def run_parser_ui():
                 bank_name=bank_name_var.get().strip() or DEFAULT_BANK_NAME,
             )
             summary_var.set(str(target))
+            clear_debit_layout_cache(target)
             refresh_sheet_and_month_options("Credit Summary")
             log_status(
                 f"默认 Excel 已生成 | {target.name} | "
