@@ -298,6 +298,14 @@ DEFAULT_BANK_NAME = ""
 CREDIT_MONTH_COL = 1
 CREDIT_BEGIN_COL = 2
 
+# Debit template rules are fixed and do NOT depend on header keywords.
+# Column A is always Merchant. Month/date headers begin from Column B.
+DEBIT_MERCHANT_COL = 1
+DEBIT_FIRST_MONTH_COL = 2
+DEBIT_MIN_PERIOD_HEADERS = 2
+DEBIT_SCAN_MAX_ROWS = 50
+DEBIT_SCAN_MAX_COLS = 300
+
 # Debit columns do not move when transactions are added.  Detect each Debit
 # sheet once per workbook path during the current program session, then reuse
 # the numeric coordinates directly instead of rescanning the worksheet.
@@ -2431,8 +2439,9 @@ def get_period_options_from_ws(ws) -> Tuple[str, List[Tuple[str, int]]]:
 
     Debit:
       - Every sheet that fails the Column-A Credit rule is classified as Debit.
-      - Writable Month columns are still located from the Debit table layout.
-      - Position = real Excel column number.
+      - Merchant is fixed at Column A.
+      - Month/date cells are detected horizontally from Column B onward.
+      - Position = real Excel column number; no Debit header keywords are used.
     """
     credit_options = get_credit_period_options_from_column_a(ws)
     # IMPORTANT: keep the exact same classification rule used everywhere else.
@@ -2649,132 +2658,80 @@ def locate_credit_columns(ws):
     return header_row, header_map
 
 def find_debit_layout(ws):
-    """Locate a horizontal Debit table, with or without a Merchant header.
+    """Build a Debit numeric layout without using header keywords.
 
-    Sheet TYPE is still decided elsewhere by the Column-A Credit rule:
-    Column A must contain >5 recognizable Month/date values to be Credit;
-    every other sheet is treated as a Debit candidate.
+    Fixed Debit template rules:
+      - Column A (1) is always Merchant.
+      - Month/date headers begin at Column B (2).
+      - The header row is the row, within a bounded top scan, containing the
+        greatest number of recognizable Month/date cells from Column B onward.
+      - The main monthly block starts at Column B. After at least a few detected
+        periods, the first TWO consecutive non-period columns terminate that block:
+        first = Total, second = Category.
+      - Any recognizable Month/date columns appearing after Category are also
+        writable periods (for example 6-Aug).
 
-    Supported Debit layouts now include both of these forms::
-
-        Merchant | Apr-25 | May-25 | ... | Total | Category | 6-Aug
-
-    and headerless-Merchant layouts such as::
-
-        Bank #234242 | Apr-25 | May-25 | ... | Total | Category | 6-Aug
-        merchant 1   |        |        | ...
-        merchant 2   |        |        | ...
-
-    In the second form, the row containing the horizontal period headers is the
-    header row, and the column immediately left of the first period is treated as
-    the Merchant column.  Detection is bounded so an accidentally huge Excel Used
-    Range cannot freeze the Tkinter UI.
+    No Merchant / Total / Category text is required or inspected.
+    The returned values are numeric coordinates and are cached by workbook+sheet.
     """
-    MAX_DEBIT_SCAN_ROWS = 50
-    MAX_DEBIT_SCAN_COLS = 200
-    MIN_FALLBACK_PERIOD_HEADERS = 2
+    row_limit = min(ws.max_row, DEBIT_SCAN_MAX_ROWS)
+    col_limit = min(ws.max_column, DEBIT_SCAN_MAX_COLS)
 
-    row_limit = min(ws.max_row, MAX_DEBIT_SCAN_ROWS)
-    col_limit = min(ws.max_column, MAX_DEBIT_SCAN_COLS)
-
-    merchant_aliases = {"MERCHANT", "VENDOR", "DESCRIPTION"}
-    total_aliases = {"TOTAL", "AMOUNT TOTAL", "GRAND TOTAL"}
-    category_aliases = {"CATEGORY", "CLASS"}
-
-    # ---------- 1) Prefer the classic explicit Merchant-header layout ----------
-    header_row = None
-    merchant_col = None
-    for row in range(1, row_limit + 1):
-        for col in range(1, col_limit + 1):
-            key = normalized_header_key(ws.cell(row=row, column=col).value)
-            if key in merchant_aliases:
-                header_row = row
-                merchant_col = col
-                break
-        if header_row is not None:
-            break
-
-    # ---------- 2) Fallback: infer the header row from horizontal Month cells ----------
-    if header_row is None:
-        best = None  # (score, row, first_period_col, period_cols, total_col, category_col)
-
-        for row in range(1, row_limit + 1):
-            period_cols_on_row = []
-            total_col_on_row = None
-            category_col_on_row = None
-
-            for col in range(1, col_limit + 1):
-                cell = ws.cell(row=row, column=col)
-                key = normalized_header_key(cell.value)
-
-                if total_col_on_row is None and key in total_aliases:
-                    total_col_on_row = col
-                if category_col_on_row is None and key in category_aliases:
-                    category_col_on_row = col
-                if looks_like_period_header(cell):
-                    period_cols_on_row.append(col)
-
-            if len(period_cols_on_row) < MIN_FALLBACK_PERIOD_HEADERS:
-                continue
-
-            # A real Debit header normally has Total; Category is an additional signal.
-            # Requiring Total prevents ordinary data rows containing a few dates from
-            # being mistaken for the table header.
-            if total_col_on_row is None:
-                continue
-
-            first_period_col = min(period_cols_on_row)
-            inferred_merchant_col = first_period_col - 1
-            if inferred_merchant_col < 1:
-                continue
-
-            score = len(period_cols_on_row) + (2 if category_col_on_row else 0)
-            candidate = (
-                score, row, inferred_merchant_col,
-                period_cols_on_row, total_col_on_row, category_col_on_row,
-            )
-            if best is None or candidate[0] > best[0]:
-                best = candidate
-
-        if best is None:
-            return None
-
-        _, header_row, merchant_col, detected_period_cols, total_col, category_col = best
-
-        # Keep the traditional monthly block between Merchant and Total, including
-        # intentionally blank month columns. Extra period columns after Total/Category
-        # are added below only when they actually look like dates.
-        month_cols = list(range(merchant_col + 1, total_col))
-        for col in detected_period_cols:
-            if col > total_col and col != category_col:
-                month_cols.append(col)
-
-        month_cols = sorted(set(month_cols))
-        return header_row, merchant_col, month_cols, total_col, category_col
-
-    # ---------- 3) Classic layout: locate Total/Category on the same row ----------
-    total_col = None
-    category_col = None
-    for col in range(1, col_limit + 1):
-        key = normalized_header_key(ws.cell(row=header_row, column=col).value)
-        if total_col is None and key in total_aliases:
-            total_col = col
-        if category_col is None and key in category_aliases:
-            category_col = col
-
-    if total_col is None:
+    if col_limit < DEBIT_FIRST_MONTH_COL:
         return None
 
-    month_cols = list(range(merchant_col + 1, total_col))
+    # 1) Find the most likely horizontal period-header row using Month/date
+    #    types only. This supports formulas that resolve to Month/date values.
+    best_row = None
+    best_period_cols = []
+    for row in range(1, row_limit + 1):
+        period_cols = []
+        for col in range(DEBIT_FIRST_MONTH_COL, col_limit + 1):
+            if looks_like_period_header(ws.cell(row=row, column=col)):
+                period_cols.append(col)
+        if len(period_cols) > len(best_period_cols):
+            best_row = row
+            best_period_cols = period_cols
 
-    # Preserve support for extra date/month columns after Total or Category.
-    for col in range(total_col + 1, col_limit + 1):
-        if col == category_col:
+    if best_row is None or len(best_period_cols) < DEBIT_MIN_PERIOD_HEADERS:
+        return None
+
+    header_row = best_row
+    merchant_col = DEBIT_MERCHANT_COL
+    period_set = set(best_period_cols)
+
+    # 2) Locate Total / Category by POSITION only.  The first two consecutive
+    #    non-period columns after the main month block are Total and Category.
+    #    Single blank/non-period cells inside the month block are tolerated.
+    total_col = None
+    category_col = None
+    detected_before_boundary = 0
+    col = DEBIT_FIRST_MONTH_COL
+    while col <= col_limit:
+        if col in period_set:
+            detected_before_boundary += 1
+            col += 1
             continue
-        if looks_like_period_header(ws.cell(row=header_row, column=col)):
-            month_cols.append(col)
 
-    month_cols = sorted(set(month_cols))
+        next_col = col + 1
+        if (
+            detected_before_boundary >= DEBIT_MIN_PERIOD_HEADERS
+            and next_col <= col_limit
+            and next_col not in period_set
+        ):
+            total_col = col
+            category_col = next_col
+            break
+
+        col += 1
+
+    if total_col is None or category_col is None:
+        return None
+
+    # 3) UI/write mapping contains only actual Month/date columns.  This means
+    #    Total/Category are automatically excluded without checking their text,
+    #    while extra dates after Category remain included.
+    month_cols = sorted(best_period_cols)
     if not month_cols:
         return None
 
