@@ -59,6 +59,7 @@ DATE_MERCHANT_LINE_RE = re.compile(
     rf'^\s*({DATE_ANY_IN_TEXT_PATTERN})\s+(.*\S)\s*$', re.IGNORECASE
 )
 
+
 def convert_custom_date_format_to_regex(date_format: str) -> str:
     """Convert one or more user date formats into a regex pattern.
 
@@ -155,7 +156,6 @@ def convert_custom_date_format_to_regex(date_format: str) -> str:
     return patterns[0] if len(patterns) == 1 else r"(?:" + "|".join(patterns) + r")"
 
 
-
 def infer_date_format_from_sample(sample_text: str) -> str:
     """Infer a unified date format from one user-entered date example.
 
@@ -243,6 +243,7 @@ def resolve_date_input_to_format(date_input: str) -> str:
 
     return ", ".join(resolved)
 
+
 def configure_date_format(custom_date_format: str):
     """Apply the custom date format, or restore defaults when blank."""
     global DATE_ANY_IN_TEXT_PATTERN
@@ -262,6 +263,7 @@ def configure_date_format(custom_date_format: str):
     DATE_MERCHANT_LINE_RE = re.compile(
         rf'^\s*({DATE_ANY_IN_TEXT_PATTERN})\s+(.*\S)\s*$', re.IGNORECASE
     )
+
 
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', re.IGNORECASE)
 URLISH_RE = re.compile(r'(https?://|www\.|\.com\b|squareup\.com\b)', re.IGNORECASE)
@@ -311,8 +313,10 @@ DEBIT_SCAN_MAX_COLS = 300
 # the numeric coordinates directly instead of rescanning the worksheet.
 DEBIT_LAYOUT_CACHE: Dict[Tuple[str, str], Tuple[int, int, Tuple[int, ...], int, Optional[int]]] = {}
 
+
 def _debit_cache_key(path: Path, sheet_name: str) -> Tuple[str, str]:
     return (str(Path(path).expanduser().resolve()).casefold(), str(sheet_name))
+
 
 def clear_debit_layout_cache(path: Optional[Path] = None):
     if path is None:
@@ -323,6 +327,7 @@ def clear_debit_layout_cache(path: Optional[Path] = None):
         if key[0] == target:
             DEBIT_LAYOUT_CACHE.pop(key, None)
 
+
 def cache_debit_layout(path: Path, sheet_name: str, layout):
     if layout is None:
         return None
@@ -331,12 +336,14 @@ def cache_debit_layout(path: Path, sheet_name: str, layout):
     DEBIT_LAYOUT_CACHE[_debit_cache_key(path, sheet_name)] = frozen
     return frozen
 
+
 def get_cached_debit_layout(path: Path, sheet_name: str):
     cached = DEBIT_LAYOUT_CACHE.get(_debit_cache_key(path, sheet_name))
     if cached is None:
         return None
     header_row, merchant_col, month_cols, total_col, category_col = cached
     return header_row, merchant_col, list(month_cols), total_col, category_col
+
 
 CREDIT_MONTH_ROWS = {
     "JAN": 3,
@@ -360,6 +367,7 @@ DEBIT_MONTH_HEADERS = ["Jan", "Feb", "March", "Apr", "May", "Jun", "Jul", "Aug",
 
 DEFAULT_UI_MONTH_LABELS = list(DEBIT_MONTH_HEADERS)
 
+
 def normalize_month_labels(labels) -> List[str]:
     """Return exactly 12 non-empty display labels, preserving Excel order."""
     cleaned = []
@@ -369,6 +377,7 @@ def normalize_month_labels(labels) -> List[str]:
     while len(cleaned) < 12:
         cleaned.append(DEFAULT_UI_MONTH_LABELS[len(cleaned)])
     return [label or DEFAULT_UI_MONTH_LABELS[i] for i, label in enumerate(cleaned)]
+
 
 def read_month_labels_from_wb(wb) -> List[str]:
     """Read the 12 display labels already stored in the Monthly workbook."""
@@ -384,6 +393,7 @@ def read_month_labels_from_wb(wb) -> List[str]:
             return normalize_month_labels(labels)
     return list(DEFAULT_UI_MONTH_LABELS)
 
+
 def read_month_labels_from_path(path: Path) -> List[str]:
     if not path.exists():
         return list(DEFAULT_UI_MONTH_LABELS)
@@ -395,37 +405,48 @@ def read_month_labels_from_path(path: Path) -> List[str]:
     except Exception:
         return list(DEFAULT_UI_MONTH_LABELS)
 
+
 # ================= 基础工具 =================
 
 def is_date_short(s: str) -> bool:
     return bool(DATE_MMDDSHORT.match(s))
 
+
 def is_date_yy(s: str) -> bool:
     return bool(DATE_MMDDYY.match(s))
+
 
 def is_date_yyyy(s: str) -> bool:
     return bool(DATE_MMDDYYYY.match(s))
 
+
 def is_date_any(s: str) -> bool:
     return bool(DATE_FULL_RE.match(str(s)))
+
 
 def is_amount(s: str) -> bool:
     return bool(AMOUNT_RE.match(s))
 
+
 def is_phone(s: str) -> bool:
     return bool(PHONE_RE.match(s))
+
 
 def is_state(s: str) -> bool:
     return bool(STATE_RE.match(s))
 
+
 def is_dot(s: str) -> bool:
     return bool(DOT_RE.match(s))
+
 
 def is_email(s: str) -> bool:
     return bool(EMAIL_RE.match(s.strip()))
 
+
 def looks_like_url_or_site(s: str) -> bool:
     return bool(URLISH_RE.search(s.strip()))
+
 
 def clean_amount(s: str) -> str:
     s = s.strip()
@@ -438,16 +459,17 @@ def clean_amount(s: str) -> str:
 
     s = (
         s.replace("$", "")
-        .replace(",", "")
-        .replace("(", "")
-        .replace(")", "")
-        .replace("-", "")
-        .strip()
+            .replace(",", "")
+            .replace("(", "")
+            .replace(")", "")
+            .replace("-", "")
+            .strip()
     )
 
     if neg and s:
         return f"-{s}"
     return s
+
 
 def clean_merchant(line: str) -> str:
     raw = ' '.join(line.split())
@@ -457,15 +479,18 @@ def clean_merchant(line: str) -> str:
             return raw[:idx].rstrip()
     return raw
 
+
 def extract_date_and_merchant(line: str):
     m = DATE_MERCHANT_LINE_RE.match(line.strip())
     if not m:
         return None, None
     return m.group(1), m.group(2).strip()
 
+
 def normalize_amount_string(amount) -> str:
     value = float(str(amount).replace(",", "").strip())
     return f"{value:.2f}"
+
 
 def safe_float(x):
     try:
@@ -485,6 +510,7 @@ def safe_float(x):
         return float(s.replace(",", ""))
     except Exception:
         return 0.0
+
 
 def build_plus_formula(parts: List[str]) -> str:
     clean_parts = []
@@ -506,6 +532,7 @@ def build_plus_formula(parts: List[str]) -> str:
         else:
             expr += f"+{p}"
     return f"={expr}"
+
 
 def split_formula_parts(formula_or_value) -> List[str]:
     if formula_or_value is None:
@@ -532,10 +559,12 @@ def split_formula_parts(formula_or_value) -> List[str]:
         out.append(f"{float(n):.2f}")
     return out
 
+
 def script_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
 
 def excel_col_letter(col_num: int) -> str:
     result = ""
@@ -544,6 +573,7 @@ def excel_col_letter(col_num: int) -> str:
         result = chr(65 + rem) + result
     return result
 
+
 # ================= Category Rules (XLSX) =================
 
 def category_rules_folder() -> Path:
@@ -551,8 +581,10 @@ def category_rules_folder() -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 
+
 def category_rules_path() -> Path:
     return category_rules_folder() / "category_rules.xlsx"
+
 
 def normalize_merchant_for_category(name: str) -> str:
     s = str(name or "").upper().strip()
@@ -567,6 +599,7 @@ def normalize_merchant_for_category(name: str) -> str:
     parts = [p for p in parts if not p.isdigit()]
 
     return " ".join(parts).strip()
+
 
 def create_default_category_rules_xlsx(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -598,6 +631,7 @@ def create_default_category_rules_xlsx(path: Path):
 
     wb.save(path)
 
+
 def load_category_rules() -> List[Tuple[str, str]]:
     path = category_rules_path()
 
@@ -617,6 +651,7 @@ def load_category_rules() -> List[Tuple[str, str]]:
             rules.append((normalize_merchant_for_category(merchant), category))
 
     return rules
+
 
 def get_category_for_merchant(merchant: str, rules: List[Tuple[str, str]]) -> str:
     raw = str(merchant or "").strip()
@@ -645,6 +680,7 @@ def get_category_for_merchant(merchant: str, rules: List[Tuple[str, str]]) -> st
 CATEGORY_REVIEW_LABEL = "REVIEW"
 CATEGORY_FUZZY_THRESHOLD = 0.86
 CATEGORY_FUZZY_MARGIN = 0.03
+
 
 def collect_category_history_from_workbook(wb) -> Dict[str, str]:
     """Collect normalized Merchant -> Category from existing workbook sheets.
@@ -689,6 +725,7 @@ def collect_category_history_from_workbook(wb) -> Dict[str, str]:
         history[norm] = best_category
     return history
 
+
 def merchant_similarity(a: str, b: str) -> float:
     """Conservative similarity score for two normalized merchant names."""
     a = normalize_merchant_for_category(a)
@@ -709,11 +746,12 @@ def merchant_similarity(a: str, b: str) -> float:
         score = max(score, 0.94)
     return score
 
+
 def get_smart_category_for_merchant(
-    merchant: str,
-    rules: List[Tuple[str, str]],
-    history: Optional[Dict[str, str]] = None,
-    fallback: str = CATEGORY_REVIEW_LABEL,
+        merchant: str,
+        rules: List[Tuple[str, str]],
+        history: Optional[Dict[str, str]] = None,
+        fallback: str = CATEGORY_REVIEW_LABEL,
 ) -> Tuple[str, str, float]:
     """Return (category, source, confidence).
 
@@ -752,13 +790,14 @@ def get_smart_category_for_merchant(
 
     # Do not auto-classify an ambiguous fuzzy match.
     if (
-        best_category
-        and best_score >= CATEGORY_FUZZY_THRESHOLD
-        and (best_score - second_score >= CATEGORY_FUZZY_MARGIN or best_score >= 0.94)
+            best_category
+            and best_score >= CATEGORY_FUZZY_THRESHOLD
+            and (best_score - second_score >= CATEGORY_FUZZY_MARGIN or best_score >= 0.94)
     ):
         return best_category, f"history-fuzzy:{best_norm}", best_score
 
     return fallback, "review", best_score
+
 
 # ================= 预处理删除内容 =================
 
@@ -781,6 +820,7 @@ def parse_remove_items(raw: str) -> List[str]:
 
     return cleaned
 
+
 def preprocess_statement_text(text: str, remove_items: List[str]) -> str:
     if not text or not remove_items:
         return text
@@ -800,6 +840,7 @@ def preprocess_statement_text(text: str, remove_items: List[str]) -> str:
 
     return "\n".join(cleaned_lines)
 
+
 # ================= 把整串文本拆成“伪多行” =================
 
 def build_amount_at_end_pattern() -> str:
@@ -814,6 +855,7 @@ def build_amount_at_end_pattern() -> str:
         r'(?:\$?\s*[\d,]+\.\d{2})'
         r')\s*$'
     )
+
 
 def expand_compact_transactions(text: str) -> List[str]:
     text = ' '.join(text.split())
@@ -858,6 +900,7 @@ def expand_compact_transactions(text: str) -> List[str]:
 
     return out_lines
 
+
 def normalize_lines(text: str) -> List[str]:
     text = text.replace('\r\n', '\n').replace('\r', '\n').strip()
     if not text:
@@ -874,6 +917,7 @@ def normalize_lines(text: str) -> List[str]:
 
     return expand_compact_transactions(text)
 
+
 # ================= 解析器 =================
 
 @dataclass
@@ -883,11 +927,13 @@ class ParseResult:
     amount: str
     who: str
 
+
 class BaseExtractor:
     name = "base"
 
     def extract(self, text: str) -> List['ParseResult']:
         raise NotImplementedError
+
 
 class SimpleDateStoreAmountExtractor(BaseExtractor):
     name = "simple_date_merchant_then_amount"
@@ -951,9 +997,11 @@ class SimpleDateStoreAmountExtractor(BaseExtractor):
 
         return results
 
+
 EXTRACTORS = {
     "a": SimpleDateStoreAmountExtractor(),
 }
+
 
 def merge_non_overlapping(results: List[ParseResult]) -> List[ParseResult]:
     results = sorted(results, key=lambda r: r.span[0])
@@ -965,6 +1013,7 @@ def merge_non_overlapping(results: List[ParseResult]) -> List[ParseResult]:
             last_end = r.span[1]
     return merged
 
+
 def parse_with_extractors(text: str, keys: List[str]) -> List[ParseResult]:
     hits: List[ParseResult] = []
     for k in keys:
@@ -974,8 +1023,10 @@ def parse_with_extractors(text: str, keys: List[str]) -> List[ParseResult]:
         hits.extend(ext.extract(text))
     return merge_non_overlapping(hits)
 
+
 def parse_auto(text: str) -> List[ParseResult]:
     return parse_with_extractors(text, ["a"])
+
 
 # ================= 数据合并 =================
 
@@ -997,12 +1048,12 @@ def merge_same_merchants(rows):
 
     return merged
 
+
 # ================= 明细合并表 =================
 
 def write_merged_xlsx(xlsx_path: Path, rows):
     merged = merge_same_merchants(rows)
     rules = load_category_rules()
-    category_history = collect_category_history_from_workbook(wb)
 
     wb = Workbook()
     ws = wb.active
@@ -1035,11 +1086,13 @@ def write_merged_xlsx(xlsx_path: Path, rows):
 
     wb.save(xlsx_path)
 
+
 # ================= Credit 月总表 =================
 
 def normalize_credit_header_name(name: str) -> str:
     s = " ".join(str(name).strip().split())
     return s.upper()
+
 
 def is_bad_credit_header_name(name: str) -> bool:
     if name is None:
@@ -1069,6 +1122,7 @@ def is_bad_credit_header_name(name: str) -> bool:
 
     return False
 
+
 def classify_credit_column(merchant: str) -> str:
     m = normalize_credit_header_name(merchant)
 
@@ -1087,6 +1141,7 @@ def classify_credit_column(merchant: str) -> str:
             return CREDIT_DEFAULT_HEADER
 
     return m
+
 
 def read_existing_credit_summary_from_wb(wb):
     existing_dynamic_headers = []
@@ -1142,6 +1197,7 @@ def read_existing_credit_summary_from_wb(wb):
 
     return bank_name, existing_dynamic_headers, existing_month_values
 
+
 def build_credit_month_matrix(existing_month_values, new_rows_by_month):
     month_values = {m: dict(existing_month_values.get(m, {})) for m in CREDIT_MONTHS}
 
@@ -1152,6 +1208,7 @@ def build_credit_month_matrix(existing_month_values, new_rows_by_month):
             month_values[month][col_name] = old_val + safe_float(amount)
 
     return month_values
+
 
 def collect_all_credit_headers(month_values, existing_dynamic_headers):
     all_dynamic = []
@@ -1170,6 +1227,7 @@ def collect_all_credit_headers(month_values, existing_dynamic_headers):
                 all_dynamic.append(h2)
 
     return all_dynamic
+
 
 def style_credit_sheet(ws, last_col):
     thin = Side(style="thin", color="000000")
@@ -1197,6 +1255,7 @@ def style_credit_sheet(ws, last_col):
 
     ws.row_dimensions[1].height = 24
     ws.row_dimensions[2].height = 24
+
 
 # ================= Debit Summary Sheet =================
 
@@ -1226,6 +1285,7 @@ def read_existing_debit_summary_from_wb(wb):
             data[merchant][month] = parts
 
     return data
+
 
 def read_existing_debit_categories_from_wb(wb) -> Dict[str, str]:
     """Read Merchant -> Category from the current debit summary.
@@ -1283,6 +1343,7 @@ def style_debit_summary_sheet(ws, last_row: int):
 
     ws.auto_filter.ref = f"A1:O{last_row}"
 
+
 def sync_credit_debit_from_debit_sheet(wb):
     if "Credit Summary" not in wb.sheetnames:
         return
@@ -1323,6 +1384,7 @@ def sync_credit_debit_from_debit_sheet(wb):
     )
     ws_credit.cell(row=15, column=debit_col_credit).number_format = "0.00"
 
+
 def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui: str):
     selected_month_ui = selected_month_ui.upper().strip()
     if selected_month_ui not in CREDIT_MONTHS:
@@ -1338,6 +1400,7 @@ def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui
     month_labels = read_month_labels_from_wb(wb)
     existing = read_existing_debit_summary_from_wb(wb)
     existing_categories = read_existing_debit_categories_from_wb(wb)
+    category_history = collect_category_history_from_workbook(wb)
     merged = merge_same_merchants(rows)
     rules = load_category_rules()
 
@@ -1393,7 +1456,7 @@ def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui
         if total_row == 2:
             ws.cell(row=total_row, column=col, value=None)
         else:
-            ws.cell(row=total_row, column=col, value=f"=SUM({col_letter}2:{col_letter}{total_row-1})")
+            ws.cell(row=total_row, column=col, value=f"=SUM({col_letter}2:{col_letter}{total_row - 1})")
             ws.cell(row=total_row, column=col).number_format = "0.00"
 
     if total_row == 2:
@@ -1414,13 +1477,14 @@ def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui
 
     wb.save(xlsx_path)
 
+
 # ================= Credit Summary 写入 =================
 
 def write_or_update_credit_summary_xlsx(
-    xlsx_path: Path,
-    rows,
-    selected_month_ui: str,
-    bank_name: str = DEFAULT_BANK_NAME
+        xlsx_path: Path,
+        rows,
+        selected_month_ui: str,
+        bank_name: str = DEFAULT_BANK_NAME
 ):
     selected_month_ui = selected_month_ui.upper().strip()
     if selected_month_ui not in CREDIT_MONTHS:
@@ -1575,6 +1639,7 @@ def write_or_update_credit_summary_xlsx(
 
     wb.save(xlsx_path)
 
+
 # ================= 已有公司报表模板导入 =================
 
 FIXED_CREDIT_HEADERS = {
@@ -1593,6 +1658,17 @@ def normalized_cell_text(value) -> str:
 
 def normalized_header_key(value) -> str:
     return normalized_cell_text(value).upper()
+
+
+def normalize_merchant_key(name: str) -> str:
+    """Normalize a merchant/income header name for de-duplication and matching.
+
+    Used to decide whether a newly parsed merchant already has a matching
+    column header on a Credit sheet (Row 2) so amounts are added to the same
+    column instead of creating duplicate columns for the same merchant due to
+    case or whitespace differences.
+    """
+    return normalized_header_key(name)
 
 
 def find_header_row(ws, required_headers: List[str], max_scan_rows: int = 80) -> Optional[int]:
@@ -1805,8 +1881,6 @@ def display_cell_text(cell) -> str:
     return normalized_cell_text(value)
 
 
-
-
 def looks_like_period_header(cell) -> bool:
     """Return True when a header cell looks like a month/date/period label.
 
@@ -1966,6 +2040,8 @@ def discover_source_report_structure(source_path: Path):
             expense_rows = found
             break
 
+    wb.close()
+
     # Always keep the program's standard deposit column.
     final_income_headers = [CREDIT_DEFAULT_HEADER]
     for header in income_headers:
@@ -2091,7 +2167,6 @@ def create_debit_template_sheet(wb, expense_rows: List[Tuple[str, str]], month_l
     style_debit_summary_sheet(ws, total_row)
 
 
-
 def create_default_monthly_workbook(xlsx_path: Path, bank_name: str = DEFAULT_BANK_NAME):
     """Create a brand-new default workbook with exactly two sheets.
 
@@ -2118,12 +2193,19 @@ def create_default_monthly_workbook(xlsx_path: Path, bank_name: str = DEFAULT_BA
     )
     create_debit_template_sheet(wb, [], month_labels)
 
+    # Link Credit Summary's DEBIT column to the monthly totals on debit summary.
+    # This is done only after both sheets exist.  The same sync helper is also
+    # called after future Debit writes so references follow the Debit Total row
+    # when new Merchant rows are inserted.
+    sync_credit_debit_from_debit_sheet(wb)
+
     # Explicitly enforce the requested order even if the helper implementations
     # are changed later.
     wb._sheets = [wb["Credit Summary"], wb[DEBIT_SHEET_NAME]]
     wb.save(xlsx_path)
     wb.close()
     return xlsx_path
+
 
 def clear_credit_amounts_keep_layout(ws) -> int:
     """Clear Credit amounts after the SINGLE Column-A type rule classifies the sheet."""
@@ -2223,10 +2305,10 @@ def clear_debit_amounts_keep_layout(ws) -> int:
 
 
 def import_existing_report_template(
-    source_path: Path,
-    target_path: Path,
-    bank_name: str = DEFAULT_BANK_NAME,
-    clear_existing_data: bool = True,
+        source_path: Path,
+        target_path: Path,
+        bank_name: str = DEFAULT_BANK_NAME,
+        clear_existing_data: bool = True,
 ):
     """完整复制源工作簿的所有工作表，并保留原始名称和顺序。
 
@@ -2440,7 +2522,7 @@ def get_period_options_from_ws(ws) -> Tuple[str, List[Tuple[str, int]]]:
     Debit:
       - Every sheet that fails the Column-A Credit rule is classified as Debit.
       - Merchant is fixed at Column A.
-      - Month/date cells are detected horizontally from Column B onward.
+      - Month/date cells are read ONLY from Row 1, horizontally from Column B onward.
       - Position = real Excel column number; no Debit header keywords are used.
     """
     credit_options = get_credit_period_options_from_column_a(ws)
@@ -2463,7 +2545,9 @@ def get_period_options_from_ws(ws) -> Tuple[str, List[Tuple[str, int]]]:
             options.append((label, col))
     return "debit", options
 
+
 def read_period_options_from_selected_sheet(path: Path, sheet_name: str) -> Tuple[str, List[Tuple[str, int]]]:
+    """Read the saved workbook, classify once, then build the UI Month mapping."""
     path = Path(path)
     if not path.exists() or not sheet_name:
         return "", []
@@ -2473,12 +2557,12 @@ def read_period_options_from_selected_sheet(path: Path, sheet_name: str) -> Tupl
             return "", []
         ws = wb[sheet_name]
 
-        credit_options = get_credit_period_options_from_column_a(ws)
-        if len(credit_options) > 5:
-            return "credit", credit_options
+        # ONE classification decision for this UI read.
+        sheet_type = classify_sheet_type(ws)
+        if sheet_type == "credit":
+            return "credit", get_credit_period_options_from_column_a(ws)
 
-        # Debit: scan only the first time for this workbook+sheet, then preserve
-        # the numeric positions for the rest of the UI session.
+        # Debit: A is Merchant; ALL UI Month mapping comes from Row 1, B1 onward.
         layout = get_cached_debit_layout(path, sheet_name)
         if layout is None:
             layout = find_debit_layout(ws)
@@ -2518,8 +2602,8 @@ def find_first_writable_sheet_name(path: Path, preferred_names: Optional[List[st
 
 
 def resolve_period_position(
-    ws, sheet_type: str, selected_label: str, selected_position: int,
-    xlsx_path: Optional[Path] = None, sheet_name: str = ""
+        ws, sheet_type: str, selected_label: str, selected_position: int,
+        xlsx_path: Optional[Path] = None, sheet_name: str = ""
 ) -> int:
     """Resolve UI target. Debit uses cached numeric columns; Credit stays dynamic."""
     if sheet_type == "debit":
@@ -2657,188 +2741,238 @@ def locate_credit_columns(ws):
     header_map[CREDIT_ENDING_HEADER] = ending_col
     return header_row, header_map
 
+
 def find_debit_layout(ws):
-    """Build a Debit numeric layout without using header keywords.
+    """Return the fixed Debit numeric layout using ONLY Row 1.
 
-    Fixed Debit template rules:
-      - Column A (1) is always Merchant.
-      - Month/date headers begin at Column B (2).
-      - The header row is the row, within a bounded top scan, containing the
-        greatest number of recognizable Month/date cells from Column B onward.
-      - The main monthly block starts at Column B. After at least a few detected
-        periods, the first TWO consecutive non-period columns terminate that block:
-        first = Total, second = Category.
-      - Any recognizable Month/date columns appearing after Category are also
-        writable periods (for example 6-Aug).
-
-    No Merchant / Total / Category text is required or inspected.
-    The returned values are numeric coordinates and are cached by workbook+sheet.
+    Strict template contract:
+      - Column A is always Merchant.
+      - Debit period headers are always on Row 1.
+      - Read Row 1 only, starting from Column B.
+      - Recognizable Month/date cells map directly to their Excel column numbers.
+      - No Merchant/Total/Category keyword search and no multi-row scanning.
     """
-    row_limit = min(ws.max_row, DEBIT_SCAN_MAX_ROWS)
+    header_row = 1
+    merchant_col = DEBIT_MERCHANT_COL
     col_limit = min(ws.max_column, DEBIT_SCAN_MAX_COLS)
-
     if col_limit < DEBIT_FIRST_MONTH_COL:
         return None
 
-    # 1) Find the most likely horizontal period-header row using Month/date
-    #    types only. This supports formulas that resolve to Month/date values.
-    best_row = None
-    best_period_cols = []
-    for row in range(1, row_limit + 1):
-        period_cols = []
-        for col in range(DEBIT_FIRST_MONTH_COL, col_limit + 1):
-            if looks_like_period_header(ws.cell(row=row, column=col)):
-                period_cols.append(col)
-        if len(period_cols) > len(best_period_cols):
-            best_row = row
-            best_period_cols = period_cols
+    month_cols = []
+    for col in range(DEBIT_FIRST_MONTH_COL, col_limit + 1):
+        if looks_like_period_header(ws.cell(row=1, column=col)):
+            month_cols.append(col)
 
-    if best_row is None or len(best_period_cols) < DEBIT_MIN_PERIOD_HEADERS:
+    if len(month_cols) < DEBIT_MIN_PERIOD_HEADERS:
         return None
 
-    header_row = best_row
-    merchant_col = DEBIT_MERCHANT_COL
-    period_set = set(best_period_cols)
-
-    # 2) Locate Total / Category by POSITION only.  The first two consecutive
-    #    non-period columns after the main month block are Total and Category.
-    #    Single blank/non-period cells inside the month block are tolerated.
+    period_set = set(month_cols)
     total_col = None
     category_col = None
-    detected_before_boundary = 0
+    seen_periods = 0
     col = DEBIT_FIRST_MONTH_COL
     while col <= col_limit:
         if col in period_set:
-            detected_before_boundary += 1
+            seen_periods += 1
             col += 1
             continue
-
-        next_col = col + 1
-        if (
-            detected_before_boundary >= DEBIT_MIN_PERIOD_HEADERS
-            and next_col <= col_limit
-            and next_col not in period_set
-        ):
-            total_col = col
-            category_col = next_col
-            break
-
+        if seen_periods >= DEBIT_MIN_PERIOD_HEADERS and col + 1 <= col_limit:
+            if col not in period_set and (col + 1) not in period_set:
+                total_col = col
+                category_col = col + 1
+                break
         col += 1
 
     if total_col is None or category_col is None:
         return None
 
-    # 3) UI/write mapping contains only actual Month/date columns.  This means
-    #    Total/Category are automatically excluded without checking their text,
-    #    while extra dates after Category remain included.
-    month_cols = sorted(best_period_cols)
-    if not month_cols:
-        return None
-
     return header_row, merchant_col, month_cols, total_col, category_col
 
 
-def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: str = DEFAULT_BANK_NAME):
-    # SINGLE TYPE RULE: Column A > 5 recognizable Month/date values => Credit.
-    # No header/layout rule is allowed to reclassify or reject the sheet type.
-    if not is_credit_sheet_by_column_a(ws):
-        raise ValueError(
-            f"Excel Sheet“{ws.title}”按 Column A 月份数量规则判定为 Debit，不能执行 Credit 写入。"
-        )
+def safe_set_merged_value(ws, row: int, col: int, value):
+    """Write a value to a cell, redirecting to the top-left cell if merged.
 
-    # From this point on the sheet is already Credit.  This helper ONLY locates
-    # control columns; it does not validate the Credit/Debit type.
-    header_row, header_map = locate_credit_columns(ws)
-    if header_row is None:
-        raise ValueError(
-            f"Excel Sheet“{ws.title}”已按 Column A 规则判定为 Credit，"
-            "但程序无法定位 Credit 的控制列（Begin / Total / Debit / Ending）。"
-        )
-    begin_col = header_map[CREDIT_BEGIN_HEADER]
-    period_rows, total_row = find_credit_period_rows(ws, header_row, begin_col)
-    if selected_period_row not in period_rows:
-        raise ValueError(
-            f"Excel Sheet“{ws.title}”中的目标日期行已变化，请重新选择 Month 后再试。"
-        )
-    month_row = selected_period_row
+    openpyxl raises ``AttributeError`` when writing to a non-top-left cell of a
+    merged range. Bank-name/header cells on imported templates are sometimes
+    merged, so this resolves the correct writable cell before assigning.
+    """
+    target_coord = ws.cell(row=row, column=col).coordinate
+    for merged_range in ws.merged_cells.ranges:
+        if target_coord in merged_range:
+            top_left_coord = merged_range.coord.split(":")[0]
+            ws[top_left_coord] = value
+            return
+    ws.cell(row=row, column=col, value=value)
 
-    # Bank name may live inside a merged title range (for example A1:L1).
-    # A non-anchor MergedCell is read-only, so never assign to it directly.
-    # If a bank name was supplied, resolve the real top-left anchor of the
-    # merged range first. Existing non-empty titles are preserved.
-    if begin_col > 1 and str(bank_name or "").strip():
-        bank_row = max(1, header_row - 1)
-        bank_col = begin_col
-        anchor_row, anchor_col = bank_row, bank_col
-        for merged_range in ws.merged_cells.ranges:
-            if (
-                merged_range.min_row <= bank_row <= merged_range.max_row
-                and merged_range.min_col <= bank_col <= merged_range.max_col
-            ):
-                anchor_row, anchor_col = merged_range.min_row, merged_range.min_col
-                break
-        bank_cell = ws.cell(row=anchor_row, column=anchor_col)
-        if bank_cell.value is None or str(bank_cell.value).strip() == "":
-            bank_cell.value = str(bank_name).strip()
 
-    merged = merge_same_merchants(rows)
-    fixed = {CREDIT_BEGIN_HEADER, CREDIT_TOTAL_HEADER, CREDIT_DEBIT_HEADER, CREDIT_ENDING_HEADER}
-    def refresh_map():
-        # Keep original merchant/header names, but always overlay the canonical
-        # Credit control-column keys returned by the flexible locator.  This is
-        # important when the workbook says e.g. "Beginning Balance" instead of
-        # the exact text "BEGIN BALANCE".
-        raw = {
-            normalized_header_key(ws.cell(row=header_row, column=c).value): c
-            for c in range(1, min(ws.max_column, 200) + 1)
-            if normalized_header_key(ws.cell(row=header_row, column=c).value)
-        }
-        # Position refresh only. Sheet type was already fixed by the Column-A rule.
-        detected_header_row, canonical = locate_credit_columns(ws)
-        if detected_header_row == header_row:
-            raw.update(canonical)
-        return raw
-    for merchant, data in merged.items():
-        target_header = classify_credit_column(merchant)
-        current_map = refresh_map()
-        target_col = current_map.get(target_header)
-        if target_col is None:
-            current_total_col = current_map[CREDIT_TOTAL_HEADER]
-            ws.insert_cols(current_total_col, 1)
-            copy_column_style(ws, max(begin_col + 1, current_total_col - 1), current_total_col,
-                              max(ws.max_row, (total_row or header_row + len(period_rows) + 1)))
-            ws.cell(row=header_row, column=current_total_col, value=target_header)
-            for r in period_rows:
-                ws.cell(row=r, column=current_total_col, value=None)
-                ws.cell(row=r, column=current_total_col).number_format = "0.00"
-            target_col = current_total_col
-        append_amount_to_cell(ws.cell(row=month_row, column=target_col), data["amounts"])
-    current_map = refresh_map()
-    begin_col = current_map[CREDIT_BEGIN_HEADER]
-    total_credit_col = current_map[CREDIT_TOTAL_HEADER]
-    debit_col = current_map[CREDIT_DEBIT_HEADER]
-    ending_col = current_map[CREDIT_ENDING_HEADER]
-    dynamic_cols = [c for c in range(begin_col + 1, total_credit_col)
-                    if normalized_header_key(ws.cell(row=header_row, column=c).value) not in fixed]
-    if not dynamic_cols:
-        raise ValueError(f"Excel Sheet“{ws.title}”没有可写入的 Credit 收入栏。")
+def rebuild_credit_total_row_formulas(ws):
+    """Rebuild every Credit TOTAL formula after dynamic column insertion.
+
+    Credit has one deliberately simple structural contract:
+      - Column A contains the writable Month/date rows.
+      - The TOTAL label is also in Column A.
+      - Column B is BEGIN BALANCE and is not changed here.
+      - Row immediately above the first Month/date row is the header row.
+      - Every populated header column from C through the last header receives
+        a TOTAL formula using the complete first-to-last Month/date row range.
+
+    ``openpyxl.insert_cols`` moves cells but does not reliably translate every
+    existing formula reference. Recreating this row after all Credit writes
+    makes the result independent of how many new merchant columns were inserted.
+    """
+    credit_periods = get_credit_period_options_from_column_a(ws)
+    period_rows = sorted({row for _, row in credit_periods})
     if not period_rows:
-        raise ValueError(f"Excel Sheet“{ws.title}”没有可识别的日期/期间行。")
+        raise ValueError("Credit Sheet 的 Column A 中找不到可用于 TOTAL 的 Month/日期行。")
+
+    first_period_row = period_rows[0]
+    last_period_row = period_rows[-1]
+    header_row = first_period_row - 1
+    if header_row < 1:
+        raise ValueError("Credit Sheet 的 Month/日期行上方找不到标题行。")
+
+    # TOTAL is located only from Column A. Prefer a TOTAL below the final
+    # Month/date row, while still accepting an existing one elsewhere.
+    total_row = None
+    fallback_total_row = None
+    for row in range(1, ws.max_row + 1):
+        label = normalized_cell_text(ws.cell(row=row, column=1).value).upper()
+        if label in {"TOTAL", "GRAND TOTAL"}:
+            if fallback_total_row is None:
+                fallback_total_row = row
+            if row > last_period_row:
+                total_row = row
+                break
+
     if total_row is None:
-        total_row = period_rows[-1] + 1
-        if begin_col > 1:
-            ws.cell(total_row, begin_col - 1, "TOTAL")
+        total_row = fallback_total_row
+    if total_row is None:
+        total_row = last_period_row + 1
+        ws.cell(row=total_row, column=1, value="TOTAL")
 
-    for r in period_rows:
-        a = ws.cell(r, dynamic_cols[0]).coordinate
-        b = ws.cell(r, dynamic_cols[-1]).coordinate
-        ws.cell(r, total_credit_col, f"=SUM({a}:{b})")
-        ws.cell(r, ending_col, f"={ws.cell(r, begin_col).coordinate}+{ws.cell(r, total_credit_col).coordinate}-{ws.cell(r, debit_col).coordinate}")
+    # Do not trust ws.max_column: imported templates may contain formatting far
+    # beyond the actual table. The last non-empty header is the real last column.
+    last_header_col = None
+    for col in range(ws.max_column, 2, -1):
+        value = ws.cell(row=header_row, column=col).value
+        if value is not None and str(value).strip() != "":
+            last_header_col = col
+            break
 
-    first_data_row, last_data_row = period_rows[0], period_rows[-1]
-    for c in dynamic_cols + [total_credit_col, debit_col]:
-        ws.cell(total_row, c, f"=SUM({ws.cell(first_data_row,c).coordinate}:{ws.cell(last_data_row,c).coordinate})")
-    ws.cell(total_row, ending_col, f"={ws.cell(last_data_row, ending_col).coordinate}")
+    if last_header_col is None:
+        return
+
+    for col in range(3, last_header_col + 1):
+        col_letter = excel_col_letter(col)
+        total_cell = ws.cell(row=total_row, column=col)
+        total_cell.value = (
+            f"=SUM({col_letter}{first_period_row}:"
+            f"{col_letter}{last_period_row})"
+        )
+        total_cell.number_format = "0.00"
+
+
+def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: str = DEFAULT_BANK_NAME):
+    """Very simple Credit writer.
+
+    Fixed Credit contract:
+      - Column A contains Month values vertically.
+      - selected_period_row is the row already mapped from Column A by the UI.
+      - Column B is BEGIN BALANCE and stays fixed.
+      - For every new Credit merchant, insert a new column BETWEEN B and current C
+        (that is, insert at Excel column 3), then write the merchant header and amount.
+      - No Credit header/layout validation is used.
+    """
+    month_col = 1  # A
+    begin_col = 2  # B
+    insert_col = 3  # always insert between B and C
+
+    if not isinstance(selected_period_row, int) or selected_period_row < 1 or selected_period_row > ws.max_row:
+        raise ValueError("Credit Month 对应的 Row 无效。")
+
+    # The row came from Column-A Month mapping. Only verify that A[row] still has
+    # a recognizable Month/date; do not inspect any Credit control headers.
+    month_cell = ws.cell(row=selected_period_row, column=month_col)
+    if not looks_like_period_header(month_cell):
+        raise ValueError(
+            f"Credit Month Row {selected_period_row} 的 Column A 已不是可识别的 Month/日期，请重新选择 Month。"
+        )
+
+    # Optional bank name: only write to the top-left writable cell of Row 1,
+    # Column B (the same convention used everywhere else in this program,
+    # e.g. create_credit_template_sheet / write_or_update_credit_summary_xlsx).
+    if bank_name:
+        try:
+            safe_set_merged_value(ws, 1, begin_col, bank_name)
+        except Exception:
+            pass
+
+    # Aggregate duplicate merchants from this import first.
+    merchant_amounts = {}
+    merchant_order = []
+    # Parsed transaction rows in this program are normally 3-tuples:
+    # (merchant, amount, who/source). Credit only needs the first two values.
+    for item in rows:
+        if not item or len(item) < 2:
+            continue
+        merchant, amount = item[0], item[1]
+        merchant = str(merchant or "").strip()
+        if not merchant:
+            continue
+        try:
+            amount = float(amount)
+        except Exception:
+            continue
+        key = normalize_merchant_key(merchant)
+        if not key:
+            continue
+        if key not in merchant_amounts:
+            merchant_order.append((key, merchant))
+            merchant_amounts[key] = 0.0
+        merchant_amounts[key] += amount
+
+    # Existing merchant headers are on Row 2. Reuse them when possible.
+    existing = {}
+    for col in range(3, ws.max_column + 1):
+        value = ws.cell(row=2, column=col).value
+        key = normalize_merchant_key(str(value or ""))
+        if key:
+            existing.setdefault(key, col)
+
+    for key, merchant in merchant_order:
+        amount = merchant_amounts[key]
+
+        if key in existing:
+            target_col = existing[key]
+        else:
+            # The user's fixed rule: every new merchant is inserted at C,
+            # directly between BEGIN BALANCE (B) and the old Column C.
+            ws.insert_cols(insert_col, 1)
+            target_col = insert_col
+            ws.cell(row=2, column=target_col, value=merchant)
+
+            # Existing column numbers shifted right by one after insertion.
+            existing = {k: (c + 1 if c >= insert_col else c) for k, c in existing.items()}
+            existing[key] = target_col
+
+        cell = ws.cell(row=selected_period_row, column=target_col)
+        current = cell.value
+        if isinstance(current, (int, float)):
+            cell.value = float(current) + amount
+        elif current in (None, ""):
+            cell.value = amount
+        else:
+            # Do not try to interpret complex formulas/text in a merchant amount cell.
+            # Replace it with this imported amount for the selected Month row.
+            cell.value = amount
+
+    # openpyxl moves existing cells during insert_cols, but it does not update
+    # all affected formulas. Always rebuild the entire Credit TOTAL row once,
+    # after every merchant/amount write has finished.
+    rebuild_credit_total_row_formulas(ws)
+
+    # Keep the fixed B-column balance chain simple. No header lookup.
+    return
 
 
 def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None):
@@ -2913,9 +3047,9 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
 
 
 def append_rows_to_selected_sheet(
-    xlsx_path: Path, sheet_name: str, rows,
-    selected_period_label: str, selected_period_position: int,
-    expected_sheet_type: str = "", bank_name: str = DEFAULT_BANK_NAME
+        xlsx_path: Path, sheet_name: str, rows,
+        selected_period_label: str, selected_period_position: int,
+        expected_sheet_type: str = "", bank_name: str = DEFAULT_BANK_NAME
 ):
     xlsx_path = Path(xlsx_path)
     if not xlsx_path.exists():
@@ -2926,10 +3060,9 @@ def append_rows_to_selected_sheet(
             raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
         ws = wb[sheet_name]
 
-        # SINGLE type rule only. No header-based reclassification.
-        detected_type = "credit" if is_credit_sheet_by_column_a(ws) else "debit"
-        if expected_sheet_type and detected_type != expected_sheet_type:
-            raise ValueError(f"Excel Sheet“{sheet_name}”类型已变化，请重新选择 Sheet 后再试。")
+        # Do not classify again after the UI already classified this Sheet.
+        # Trust the UI's single decision for this Start operation.
+        detected_type = expected_sheet_type if expected_sheet_type in ("credit", "debit") else classify_sheet_type(ws)
 
         debit_layout = None
         if detected_type == "debit":
@@ -2949,6 +3082,10 @@ def append_rows_to_selected_sheet(
             update_credit_sheet_in_place(ws, rows, real_position, bank_name)
         else:
             update_debit_sheet_in_place(ws, rows, real_position, layout=debit_layout)
+            # Adding a new Debit Merchant can move the Debit Total row downward.
+            # Rebuild Credit Summary's DEBIT references so Jan-Dec always point
+            # to the current monthly Total cells rather than a stale row number.
+            sync_credit_debit_from_debit_sheet(wb)
         wb.save(xlsx_path)
         return detected_type
     finally:
@@ -3054,7 +3191,7 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
                 for value in data["period_values"][col]:
                     all_parts.extend(split_formula_parts(value))
                 ws.cell(row=keep_row, column=col).value = (
-                    build_plus_formula(all_parts) or None
+                        build_plus_formula(all_parts) or None
                 )
 
             # Total 只计算真正的期间列，不包含 Category。
@@ -3102,6 +3239,7 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
     finally:
         wb.close()
 
+
 # ================= GUI =================
 
 import tkinter as tk
@@ -3111,10 +3249,12 @@ BG = "#1e1e1e"
 FG = "#ffffff"
 BTN = "#2d2d2d"
 
+
 def mk_label(parent, text="", **kw):
     params = {"bg": BG, "fg": FG}
     params.update(kw)
     return tk.Label(parent, text=text, **params)
+
 
 def mk_button(parent, text, cmd):
     return tk.Button(
@@ -3130,6 +3270,7 @@ def mk_button(parent, text, cmd):
         bd=1,
         highlightthickness=0
     )
+
 
 def run_parser_ui():
     root = tk.Tk()
@@ -3423,8 +3564,11 @@ def run_parser_ui():
                 bank_name=bank_name_var.get().strip() or DEFAULT_BANK_NAME,
                 clear_existing_data=clear_existing_data,
             )
+            # STRICT ORDER: generation/save is complete before UI reads the generated workbook.
             summary_var.set(str(target))
             clear_debit_layout_cache(target)
+            sheet_var.set("")
+            month_var.set("")
             first_writable_sheet = find_first_writable_sheet_name(target, imported_sheet_names)
             refresh_sheet_and_month_options(first_writable_sheet)
             log_status(
@@ -3463,9 +3607,9 @@ def run_parser_ui():
             selected_month_display = month_var.get().strip()
             selected_month_index = month_box.current()
             if (
-                selected_month_index < 0
-                or selected_month_index >= len(months)
-                or selected_month_index >= len(period_positions)
+                    selected_month_index < 0
+                    or selected_month_index >= len(months)
+                    or selected_month_index >= len(period_positions)
             ):
                 messagebox.showerror("错误", "请选择有效日期/月份")
                 return
@@ -3638,6 +3782,7 @@ def run_parser_ui():
     mk_button(default_buttons, "生成默认表格", create_default_excel).pack()
 
     root.mainloop()
+
 
 if __name__ == "__main__":
     try:
