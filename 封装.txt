@@ -1,0 +1,1 @@
+pyinstaller --clean --noconfirm --onefile --windowed --collect-all openpyxl --name BSDP main.py

@@ -313,6 +313,11 @@ DEBIT_SCAN_MAX_COLS = 300
 # the numeric coordinates directly instead of rescanning the worksheet.
 DEBIT_LAYOUT_CACHE: Dict[Tuple[str, str], Tuple[int, int, Tuple[int, ...], int, Optional[int]]] = {}
 
+# Credit/Debit sheet-type classification is also cached per workbook path +
+# sheet name, so switching sheets in the UI does not repeatedly rescan Column A
+# of every worksheet in the workbook.
+SHEET_TYPE_CACHE: Dict[Tuple[str, str], str] = {}
+
 
 def _debit_cache_key(path: Path, sheet_name: str) -> Tuple[str, str]:
     return (str(Path(path).expanduser().resolve()).casefold(), str(sheet_name))
@@ -321,11 +326,15 @@ def _debit_cache_key(path: Path, sheet_name: str) -> Tuple[str, str]:
 def clear_debit_layout_cache(path: Optional[Path] = None):
     if path is None:
         DEBIT_LAYOUT_CACHE.clear()
+        SHEET_TYPE_CACHE.clear()
         return
     target = str(Path(path).expanduser().resolve()).casefold()
     for key in list(DEBIT_LAYOUT_CACHE):
         if key[0] == target:
             DEBIT_LAYOUT_CACHE.pop(key, None)
+    for key in list(SHEET_TYPE_CACHE):
+        if key[0] == target:
+            SHEET_TYPE_CACHE.pop(key, None)
 
 
 def cache_debit_layout(path: Path, sheet_name: str, layout):
@@ -343,6 +352,15 @@ def get_cached_debit_layout(path: Path, sheet_name: str):
         return None
     header_row, merchant_col, month_cols, total_col, category_col = cached
     return header_row, merchant_col, list(month_cols), total_col, category_col
+
+
+def cache_sheet_type(path: Path, sheet_name: str, sheet_type: str) -> str:
+    SHEET_TYPE_CACHE[_debit_cache_key(path, sheet_name)] = sheet_type
+    return sheet_type
+
+
+def get_cached_sheet_type(path: Path, sheet_name: str) -> Optional[str]:
+    return SHEET_TYPE_CACHE.get(_debit_cache_key(path, sheet_name))
 
 
 CREDIT_MONTH_ROWS = {
@@ -366,6 +384,12 @@ DEBIT_SHEET_NAME = "debit summary"
 DEBIT_MONTH_HEADERS = ["Jan", "Feb", "March", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 DEFAULT_UI_MONTH_LABELS = list(DEBIT_MONTH_HEADERS)
+
+# Credit structure is fixed at 12 months + 1 TOTAL row (~15 rows). Limiting the
+# Column-A scan range to this size prevents stray date-like text left over
+# elsewhere in a large/old worksheet (far below the real data) from being
+# miscounted as Credit period rows and misclassifying a Debit sheet as Credit.
+CREDIT_COLUMN_A_SCAN_MAX_ROWS = 60
 
 
 def normalize_month_labels(labels) -> List[str]:
@@ -1785,6 +1809,55 @@ DIRECT_LOCAL_REF_RE = re.compile(
 )
 
 
+def retarget_cross_sheet_row_references(wb, sheet_name: str, old_row: int, new_row: int) -> int:
+    """Repair formulas elsewhere in the workbook that reference a specific row
+    on ``sheet_name`` after that row has moved (e.g. its Total row, after
+    merging duplicate merchants deleted rows above it, or after inserting a
+    new merchant row pushed it down).
+
+    openpyxl edits the workbook structurally (row insert/delete) but has no
+    formula engine, so it never rewrites cross-sheet formula references that
+    live on OTHER sheets -- only same-sheet formulas get any special handling,
+    and even that only for a few operations. A Credit sheet's DEBIT column
+    (or any other imported cross-sheet reference such as
+    ='Some Debit Sheet'!G14) is exactly this kind of reference: once the
+    referenced Debit sheet's Total row moves, that formula keeps pointing at
+    the old row and silently reads stale/wrong data or a leftover empty cell.
+
+    This scans every worksheet for a formula containing a reference to
+    ``sheet_name`` at ``old_row`` (any column, with or without $ anchors,
+    quoted or bare sheet name) and rewrites just the row number to
+    ``new_row``, leaving the column letter, $ anchors, and the rest of the
+    formula untouched. Returns the number of formula cells updated.
+    """
+    if old_row == new_row or old_row is None or new_row is None:
+        return 0
+
+    escaped_name = re.escape(sheet_name.replace("'", "''"))
+    needs_quotes = bool(re.search(r"[^A-Za-z0-9_]", sheet_name)) or sheet_name[:1].isdigit()
+    if needs_quotes:
+        sheet_pattern = rf"'{escaped_name}'"
+    else:
+        sheet_pattern = rf"(?:'{escaped_name}'|{re.escape(sheet_name)})"
+
+    ref_re = re.compile(
+        rf"({sheet_pattern}!\s*\$?[A-Z]{{1,3}}\$?){old_row}\b"
+    )
+
+    updated = 0
+    for other_ws in wb.worksheets:
+        for row_cells in other_ws.iter_rows():
+            for cell in row_cells:
+                value = cell.value
+                if not isinstance(value, str) or not value.lstrip().startswith("="):
+                    continue
+                new_value, count = ref_re.subn(rf"\g<1>{new_row}", value)
+                if count:
+                    cell.value = new_value
+                    updated += 1
+    return updated
+
+
 def _resolve_direct_reference_cell(cell, visited=None):
     """Resolve a simple Excel reference formula to the cell it points to.
 
@@ -2233,7 +2306,18 @@ def clear_credit_amounts_keep_layout(ws) -> int:
     for row in period_rows:
         for col in dynamic_cols:
             ws.cell(row=row, column=col).value = None
-        ws.cell(row=row, column=debit_col).value = None
+        # The DEBIT column is different from the dynamic income columns above:
+        # those hold plain historical amounts and should always be reset, but
+        # DEBIT very often holds a FORMULA -- most commonly a cross-sheet link
+        # to the paired Debit sheet's Total row (e.g. ='Some Debit Sheet'!G14),
+        # imported as-is from the original company report. Blindly clearing it
+        # to None destroys that link entirely, so future Debit entries would
+        # stop showing up here at all. Only clear a literal stored amount;
+        # leave any formula (the structural link) untouched.
+        debit_cell = ws.cell(row=row, column=debit_col)
+        debit_value = debit_cell.value
+        if not (isinstance(debit_value, str) and debit_value.lstrip().startswith("=")):
+            debit_cell.value = None
 
     # Rebuild the controlled formulas without renaming or recreating the sheet.
     if first_data_row <= ws.max_row:
@@ -2482,16 +2566,25 @@ def list_workbook_sheet_names(path: Path) -> List[str]:
 def get_credit_period_options_from_column_a(ws) -> List[Tuple[str, int]]:
     """Return Credit Month options found specifically in worksheet Column A.
 
-    New program rule: a worksheet is Credit only when Column A contains more than
+    Program rule: a worksheet is Credit only when Column A contains more than
     5 recognizable month/date/period values.  The returned position is the real row
     number so the UI Month stays directly linked to the Credit target row.
+
+    The scan is intentionally bounded to CREDIT_COLUMN_A_SCAN_MAX_ROWS (the real
+    Credit layout is at most ~15 rows: 12 months + 1 TOTAL row). Without this
+    bound, stray date-like text left far below the real data on a large/old
+    worksheet (for example leftover formatting or unrelated text many rows
+    down) could be miscounted as extra Credit periods and cause a normal
+    Debit sheet to be misclassified as Credit -- which is what produced the
+    transposed/garbled layout (merchant names turned into column headers).
 
     Direct-reference formulas are supported through ``display_cell_text`` /
     ``looks_like_period_header``; for example ``='CHASE #3444'!A3`` can resolve
     to ``Apr-24`` while the writable target remains the current worksheet row.
     """
     options: List[Tuple[str, int]] = []
-    for row in range(1, ws.max_row + 1):
+    limit = min(ws.max_row, CREDIT_COLUMN_A_SCAN_MAX_ROWS)
+    for row in range(1, limit + 1):
         cell = ws.cell(row=row, column=1)
         if not looks_like_period_header(cell):
             continue
@@ -2537,9 +2630,10 @@ def get_period_options_from_ws(ws) -> Tuple[str, List[Tuple[str, int]]]:
     if debit_layout is None:
         return "debit", []
 
-    header_row, _, month_cols, _, _ = debit_layout
+    header_row, _, month_cols, _, category_col = debit_layout
+    all_cols = list(month_cols) + find_extra_debit_period_columns(ws, category_col)
     options: List[Tuple[str, int]] = []
-    for col in month_cols:
+    for col in all_cols:
         label = display_cell_text(ws.cell(row=header_row, column=col)).strip()
         if label:
             options.append((label, col))
@@ -2551,14 +2645,25 @@ def read_period_options_from_selected_sheet(path: Path, sheet_name: str) -> Tupl
     path = Path(path)
     if not path.exists() or not sheet_name:
         return "", []
-    wb = load_workbook(path, read_only=True, data_only=False)
+    # IMPORTANT: do not open with read_only=True here. openpyxl's read-only mode
+    # is optimized for sequential streaming; ws.cell(row=, column=) random access
+    # (used throughout classification and layout detection) forces it to
+    # internally re-scan from the top of the sheet on every call, which turns an
+    # otherwise-fast lookup into an O(n^2) operation on large worksheets and is
+    # the direct cause of the UI freezing when switching sheets.
+    wb = load_workbook(path, read_only=False, data_only=False)
     try:
         if sheet_name not in wb.sheetnames:
             return "", []
         ws = wb[sheet_name]
 
-        # ONE classification decision for this UI read.
-        sheet_type = classify_sheet_type(ws)
+        # ONE classification decision for this UI read, reused via cache so
+        # repeated sheet switches don't keep re-scanning Column A.
+        sheet_type = get_cached_sheet_type(path, sheet_name)
+        if sheet_type is None:
+            sheet_type = classify_sheet_type(ws)
+            cache_sheet_type(path, sheet_name, sheet_type)
+
         if sheet_type == "credit":
             return "credit", get_credit_period_options_from_column_a(ws)
 
@@ -2571,9 +2676,10 @@ def read_period_options_from_selected_sheet(path: Path, sheet_name: str) -> Tupl
         if layout is None:
             return "debit", []
 
-        header_row, _, month_cols, _, _ = layout
+        header_row, _, month_cols, _, category_col = layout
+        all_cols = list(month_cols) + find_extra_debit_period_columns(ws, category_col)
         options = []
-        for col in month_cols:
+        for col in all_cols:
             label = display_cell_text(ws.cell(row=header_row, column=col)).strip()
             if label:
                 options.append((label, col))
@@ -2587,13 +2693,38 @@ def find_first_writable_sheet_name(path: Path, preferred_names: Optional[List[st
     path = Path(path)
     if not path.exists():
         return ""
-    wb = load_workbook(path, read_only=True, data_only=False)
+    # See read_period_options_from_selected_sheet: read_only=True + random cell
+    # access is what caused the UI to freeze, so this also opens non-read-only
+    # and reuses the sheet-type/layout caches.
+    wb = load_workbook(path, read_only=False, data_only=False)
     try:
         ordered_names = list(preferred_names or []) + [n for n in wb.sheetnames if n not in (preferred_names or [])]
         for name in ordered_names:
             if name not in wb.sheetnames:
                 continue
-            _, options = get_period_options_from_ws(wb[name])
+            ws = wb[name]
+
+            sheet_type = get_cached_sheet_type(path, name)
+            if sheet_type is None:
+                sheet_type = classify_sheet_type(ws)
+                cache_sheet_type(path, name, sheet_type)
+
+            if sheet_type == "credit":
+                options = get_credit_period_options_from_column_a(ws)
+            else:
+                layout = get_cached_debit_layout(path, name)
+                if layout is None:
+                    layout = find_debit_layout(ws)
+                    if layout is not None:
+                        cache_debit_layout(path, name, layout)
+                options = []
+                if layout is not None:
+                    header_row, _, month_cols, _, category_col = layout
+                    all_cols = list(month_cols) + find_extra_debit_period_columns(ws, category_col)
+                    options = [
+                        c for c in all_cols
+                        if display_cell_text(ws.cell(row=header_row, column=c)).strip()
+                    ]
             if options:
                 return name
         return ""
@@ -2617,8 +2748,9 @@ def resolve_period_position(
                 cache_debit_layout(xlsx_path, sheet_name, layout)
         if layout is None:
             raise ValueError(f"Excel Sheet“{ws.title}”没有可用的 Debit 固定列映射。")
-        header_row, _, month_cols, _, _ = layout
-        if selected_position not in month_cols:
+        header_row, _, month_cols, _, category_col = layout
+        valid_cols = set(month_cols) | set(find_extra_debit_period_columns(ws, category_col))
+        if selected_position not in valid_cols:
             raise ValueError("当前 Month 对应的 Debit 固定列不存在，请重新选择 Sheet。")
         # Column number is authoritative. Label is UI display only.
         return selected_position
@@ -2786,7 +2918,47 @@ def find_debit_layout(ws):
     if total_col is None or category_col is None:
         return None
 
+    # Only the date/period columns BEFORE Total/Category count as real Debit
+    # data columns for AGGREGATION purposes. Some templates have a stray
+    # recognizable date-like column AFTER Category (e.g. a pre-created
+    # "Apr-26" column for a future month) -- looks_like_period_header()
+    # matches it, so the initial scan above picks it up too. Without this
+    # filter, that trailing column silently gets pulled into every SUM/Total
+    # formula (per-merchant Total, the bottom TOTAL row, and the
+    # merge-duplicate-merchants feature). Trimming month_cols here fixes that
+    # everywhere at once, since every aggregation caller (write's Total
+    # formula, merge, clear-amounts, category learning) goes through this
+    # single function. A column after Category should still be selectable in
+    # the UI as a write target -- that is handled separately by
+    # find_extra_debit_period_columns() below, used only by the UI-facing
+    # month-option builders, never by anything that builds a SUM formula.
+    month_cols = [c for c in month_cols if c < total_col]
+    if len(month_cols) < DEBIT_MIN_PERIOD_HEADERS:
+        return None
+
     return header_row, merchant_col, month_cols, total_col, category_col
+
+
+def find_extra_debit_period_columns(ws, category_col: int, col_limit: Optional[int] = None) -> List[int]:
+    """Find additional recognizable period columns positioned AFTER Category.
+
+    Some templates append a new month column after Total/Category (e.g. a
+    freshly added "Apr-26" column for next year) instead of inserting it
+    within the original month block, so Total/Category stay in place. Such a
+    column should still be selectable in the UI as a write target, but per
+    program rule it must NEVER be pulled into any Total/SUM aggregation --
+    Total only ever sums the block strictly before Total/Category (see
+    find_debit_layout). This is intentionally decided purely by column
+    position, never by header wording, since header text varies across
+    templates.
+    """
+    if col_limit is None:
+        col_limit = min(ws.max_column, DEBIT_SCAN_MAX_COLS)
+    extra_cols = []
+    for col in range(category_col + 1, col_limit + 1):
+        if looks_like_period_header(ws.cell(row=1, column=col)):
+            extra_cols.append(col)
+    return extra_cols
 
 
 def safe_set_merged_value(ws, row: int, col: int, value):
@@ -2813,8 +2985,14 @@ def rebuild_credit_total_row_formulas(ws):
       - The TOTAL label is also in Column A.
       - Column B is BEGIN BALANCE and is not changed here.
       - Row immediately above the first Month/date row is the header row.
-      - Every populated header column from C through the last header receives
-        a TOTAL formula using the complete first-to-last Month/date row range.
+      - Every populated header column strictly between Begin (column B) and
+        Ending (the rightmost populated header) receives a normal vertical
+        SUM formula over the full Month/date row range. Ending itself is
+        never summed -- it is set to reference the final period's Ending
+        value, since summing 12 running balances is meaningless. Both
+        boundaries are found purely by position, never by matching header
+        text such as "Begin"/"Ending", since real templates word these
+        differently.
 
     ``openpyxl.insert_cols`` moves cells but does not reliably translate every
     existing formula reference. Recreating this row after all Credit writes
@@ -2862,7 +3040,20 @@ def rebuild_credit_total_row_formulas(ws):
     if last_header_col is None:
         return
 
-    for col in range(3, last_header_col + 1):
+    # Position-based rule, never text-based (header wording for Begin/Ending
+    # varies by template -- e.g. "Begin" vs "BEGIN BALANCE"): Column B is
+    # always BEGIN and stays untouched here (a "total of monthly begin
+    # balances" has no accounting meaning). By this program's fixed Credit
+    # column order, ENDING BALANCE is always written as the LAST column, so
+    # the rightmost populated header found above is always Ending -- whatever
+    # it happens to be named. Its Total-row cell must reference the final
+    # period's Ending value rather than being summed (summing 12 running
+    # balances is meaningless). Every column strictly between Begin and
+    # Ending (the dynamic income columns, TOTAL CREDIT, DEBIT) gets a normal
+    # vertical SUM -- this is the fix for "Total 行没有把 Begin 和 Ending
+    # 之间的都加总".
+    ending_col = last_header_col
+    for col in range(3, ending_col):
         col_letter = excel_col_letter(col)
         total_cell = ws.cell(row=total_row, column=col)
         total_cell.value = (
@@ -2870,6 +3061,12 @@ def rebuild_credit_total_row_formulas(ws):
             f"{col_letter}{last_period_row})"
         )
         total_cell.number_format = "0.00"
+
+    ending_letter = excel_col_letter(ending_col)
+    last_period_ending_ref = f"{ending_letter}{last_period_row}"
+    ending_total_cell = ws.cell(row=total_row, column=ending_col)
+    ending_total_cell.value = f"={last_period_ending_ref}"
+    ending_total_cell.number_format = "0.00"
 
 
 def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: str = DEFAULT_BANK_NAME):
@@ -2983,7 +3180,8 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
     if layout is None:
         raise ValueError(f"Excel Sheet“{ws.title}”不是可识别的 Debit 格式。")
     header_row, merchant_col, month_cols, total_col, category_col = layout
-    if selected_period_col not in month_cols:
+    extra_cols = find_extra_debit_period_columns(ws, category_col)
+    if selected_period_col not in month_cols and selected_period_col not in extra_cols:
         raise ValueError(
             f"Excel Sheet“{ws.title}”中的目标日期列已变化，请重新选择 Month 后再试。"
         )
@@ -3014,8 +3212,13 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
                 if learned_category.upper() != CATEGORY_REVIEW_LABEL:
                     category_history[normalize_merchant_for_category(name)] = learned_category
     if total_row is None:
+        # No existing Total row to preserve a reference to -- nothing else in
+        # the workbook could already be pointing at it, so no repair is needed.
+        old_total_row = None
         total_row = ws.max_row + 1
         ws.cell(total_row, merchant_col, "Total")
+    else:
+        old_total_row = total_row
     for merchant, data in merged.items():
         r = merchant_rows.get(merchant.casefold())
         if r is None:
@@ -3045,6 +3248,13 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
         ws.cell(total_row, total_col,
                 build_sum_formula_for_columns(ws, total_row, month_cols))
 
+    # Inserting a brand-new merchant row pushes the Total row down. Repair any
+    # cross-sheet formula elsewhere in the workbook (e.g. a paired Credit
+    # sheet's DEBIT column imported from an existing report) that still
+    # references the old Total row position.
+    if old_total_row is not None and old_total_row != total_row:
+        retarget_cross_sheet_row_references(ws.parent, ws.title, old_total_row, total_row)
+
 
 def append_rows_to_selected_sheet(
         xlsx_path: Path, sheet_name: str, rows,
@@ -3060,9 +3270,20 @@ def append_rows_to_selected_sheet(
             raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
         ws = wb[sheet_name]
 
-        # Do not classify again after the UI already classified this Sheet.
-        # Trust the UI's single decision for this Start operation.
-        detected_type = expected_sheet_type if expected_sheet_type in ("credit", "debit") else classify_sheet_type(ws)
+        # Safety check: never blindly trust the UI-cached type. Re-classify this
+        # exact worksheet right before writing. If the UI's remembered type no
+        # longer matches, stop and raise instead of silently writing a Debit
+        # sheet through the Credit path (or vice versa) -- that mismatch is what
+        # produced the transposed/garbled Credit-shaped output on a Debit sheet.
+        fresh_type = classify_sheet_type(ws)
+        if expected_sheet_type in ("credit", "debit") and expected_sheet_type != fresh_type:
+            raise ValueError(
+                f"Excel Sheet“{sheet_name}”的识别结果发生变化"
+                f"(界面记录为 {expected_sheet_type}，重新检测为 {fresh_type})。\n"
+                "请重新在下拉框中选择该 Sheet 后再点击 Start，避免写错位置。"
+            )
+        detected_type = fresh_type
+        cache_sheet_type(xlsx_path, sheet_name, detected_type)
 
         debit_layout = None
         if detected_type == "debit":
@@ -3229,6 +3450,14 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
                 ws.cell(row=new_summary_row, column=total_col).value = (
                     build_sum_formula_for_columns(ws, new_summary_row, period_cols)
                 )
+
+        # Merging can delete rows and move the Total row upward. Any formula
+        # on another sheet (most commonly the paired Credit sheet's DEBIT
+        # column, imported from an existing company report) that references
+        # this sheet's OLD Total row must be repointed at the new one, or it
+        # will keep reading a stale/empty row after the merge.
+        if summary_row is not None and new_summary_row is not None:
+            retarget_cross_sheet_row_references(wb, sheet_name, summary_row, new_summary_row)
 
         wb.save(xlsx_path)
         return {
