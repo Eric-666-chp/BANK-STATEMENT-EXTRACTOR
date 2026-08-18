@@ -1073,184 +1073,11 @@ def merge_same_merchants(rows):
     return merged
 
 
-# ================= 明细合并表 =================
-
-def write_merged_xlsx(xlsx_path: Path, rows):
-    merged = merge_same_merchants(rows)
-    rules = load_category_rules()
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Merged Transactions"
-
-    ws["A1"] = "Merchant"
-    ws["B1"] = "Amount"
-    ws["C1"] = "Category"
-
-    sorted_items = sorted(
-        merged.items(),
-        key=lambda item: item[0].strip().lower()
-    )
-
-    r = 2
-    for merchant, data in sorted_items:
-        amounts = data["amounts"]
-        formula = build_plus_formula(amounts)
-        category = get_category_for_merchant(merchant, rules)
-
-        ws.cell(row=r, column=1, value=merchant)
-        ws.cell(row=r, column=2, value=formula)
-        ws.cell(row=r, column=3, value=category)
-        ws.cell(row=r, column=2).number_format = '0.00'
-        r += 1
-
-    ws.column_dimensions["A"].width = 60
-    ws.column_dimensions["B"].width = 18
-    ws.column_dimensions["C"].width = 20
-
-    wb.save(xlsx_path)
-
-
 # ================= Credit 月总表 =================
 
 def normalize_credit_header_name(name: str) -> str:
     s = " ".join(str(name).strip().split())
     return s.upper()
-
-
-def is_bad_credit_header_name(name: str) -> bool:
-    if name is None:
-        return True
-
-    s = str(name).strip()
-    if not s:
-        return True
-
-    s_upper = s.upper()
-
-    allowed_fixed = {
-        CREDIT_BEGIN_HEADER,
-        CREDIT_TOTAL_HEADER,
-        CREDIT_DEBIT_HEADER,
-        CREDIT_ENDING_HEADER,
-        CREDIT_DEFAULT_HEADER,
-    }
-    if s_upper in allowed_fixed:
-        return False
-
-    if re.fullmatch(r'-?\d+(\.\d+)?', s):
-        return True
-
-    if s_upper in {"COUNT", "TOTAL", "AMOUNT", "MERCHANT", "CATEGORY"}:
-        return True
-
-    return False
-
-
-def classify_credit_column(merchant: str) -> str:
-    m = normalize_credit_header_name(merchant)
-
-    default_keywords = [
-        "CASH",
-        "CHECK",
-        "DEPOSIT",
-        "CASH APP",
-        "CASH DEPOSIT",
-        "CHECK DEPOSIT",
-        "CASH / CHECK DEPOSIT",
-    ]
-
-    for kw in default_keywords:
-        if kw in m:
-            return CREDIT_DEFAULT_HEADER
-
-    return m
-
-
-def read_existing_credit_summary_from_wb(wb):
-    existing_dynamic_headers = []
-    existing_month_values = {m: {} for m in CREDIT_MONTHS}
-    bank_name = DEFAULT_BANK_NAME
-
-    if "Credit Summary" not in wb.sheetnames:
-        return bank_name, existing_dynamic_headers, existing_month_values
-
-    ws = wb["Credit Summary"]
-
-    bank_cell = ws.cell(row=1, column=2).value
-    if bank_cell:
-        bank_name = str(bank_cell).strip()
-
-    headers = {}
-    for col in range(2, ws.max_column + 1):
-        val = ws.cell(row=2, column=col).value
-        if val is None:
-            continue
-
-        raw_header = str(val).strip()
-        if not raw_header:
-            continue
-
-        normalized = normalize_credit_header_name(raw_header)
-
-        if is_bad_credit_header_name(normalized):
-            continue
-
-        headers[col] = normalized
-
-    fixed_headers = {
-        CREDIT_BEGIN_HEADER,
-        CREDIT_TOTAL_HEADER,
-        CREDIT_DEBIT_HEADER,
-        CREDIT_ENDING_HEADER,
-    }
-
-    dynamic_cols = []
-    for col in sorted(headers.keys()):
-        h = headers[col]
-        if h not in fixed_headers:
-            dynamic_cols.append((col, h))
-
-    existing_dynamic_headers = [h for _, h in dynamic_cols]
-
-    for month, row_idx in CREDIT_MONTH_ROWS.items():
-        for col, h in dynamic_cols:
-            val = ws.cell(row=row_idx, column=col).value
-            if val is not None and str(val).strip() != "":
-                existing_month_values[month][h] = safe_float(val)
-
-    return bank_name, existing_dynamic_headers, existing_month_values
-
-
-def build_credit_month_matrix(existing_month_values, new_rows_by_month):
-    month_values = {m: dict(existing_month_values.get(m, {})) for m in CREDIT_MONTHS}
-
-    for month, rows in new_rows_by_month.items():
-        for merchant, amount, _ in rows:
-            col_name = classify_credit_column(merchant)
-            old_val = month_values[month].get(col_name, 0.0)
-            month_values[month][col_name] = old_val + safe_float(amount)
-
-    return month_values
-
-
-def collect_all_credit_headers(month_values, existing_dynamic_headers):
-    all_dynamic = []
-
-    all_dynamic.append(CREDIT_DEFAULT_HEADER)
-
-    for h in existing_dynamic_headers:
-        h2 = normalize_credit_header_name(h)
-        if h2 != CREDIT_DEFAULT_HEADER and h2 not in all_dynamic:
-            all_dynamic.append(h2)
-
-    for month in CREDIT_MONTHS:
-        for h in month_values.get(month, {}):
-            h2 = normalize_credit_header_name(h)
-            if h2 != CREDIT_DEFAULT_HEADER and h2 not in all_dynamic:
-                all_dynamic.append(h2)
-
-    return all_dynamic
 
 
 def style_credit_sheet(ws, last_col):
@@ -1282,63 +1109,6 @@ def style_credit_sheet(ws, last_col):
 
 
 # ================= Debit Summary Sheet =================
-
-def read_existing_debit_summary_from_wb(wb):
-    data = {}
-
-    if DEBIT_SHEET_NAME not in wb.sheetnames:
-        return data
-
-    ws = wb[DEBIT_SHEET_NAME]
-
-    for row in range(2, ws.max_row + 1):
-        merchant = ws.cell(row=row, column=1).value
-        if merchant is None:
-            continue
-
-        merchant = str(merchant).strip()
-        if not merchant or merchant.lower() == "total":
-            continue
-
-        if merchant not in data:
-            data[merchant] = {m: [] for m in CREDIT_MONTHS}
-
-        for idx, month in enumerate(CREDIT_MONTHS, start=2):
-            cell_val = ws.cell(row=row, column=idx).value
-            parts = split_formula_parts(cell_val)
-            data[merchant][month] = parts
-
-    return data
-
-
-def read_existing_debit_categories_from_wb(wb) -> Dict[str, str]:
-    """Read Merchant -> Category from the current debit summary.
-
-    This preserves categories imported from an existing company report instead
-    of replacing them every time new bank-statement data is appended.
-    """
-    categories: Dict[str, str] = {}
-
-    if DEBIT_SHEET_NAME not in wb.sheetnames:
-        return categories
-
-    ws = wb[DEBIT_SHEET_NAME]
-    for row in range(2, ws.max_row + 1):
-        merchant = ws.cell(row=row, column=1).value
-        if merchant is None:
-            continue
-
-        merchant_text = str(merchant).strip()
-        if not merchant_text or merchant_text.lower() == "total":
-            continue
-
-        category = ws.cell(row=row, column=15).value
-        category_text = str(category).strip() if category is not None else ""
-        if category_text:
-            categories[merchant_text] = category_text
-
-    return categories
-
 
 def style_debit_summary_sheet(ws, last_row: int):
     thin = Side(style="thin", color="000000")
@@ -1407,261 +1177,6 @@ def sync_credit_debit_from_debit_sheet(wb):
         value=f"='{DEBIT_SHEET_NAME}'!N{debit_total_row}"
     )
     ws_credit.cell(row=15, column=debit_col_credit).number_format = "0.00"
-
-
-def write_or_update_debit_summary_sheet(xlsx_path: Path, rows, selected_month_ui: str):
-    selected_month_ui = selected_month_ui.upper().strip()
-    if selected_month_ui not in CREDIT_MONTHS:
-        selected_month_ui = "JAN"
-
-    if xlsx_path.exists():
-        wb = load_workbook(xlsx_path)
-    else:
-        wb = Workbook()
-        default_ws = wb.active
-        default_ws.title = "Sheet"
-
-    month_labels = read_month_labels_from_wb(wb)
-    existing = read_existing_debit_summary_from_wb(wb)
-    existing_categories = read_existing_debit_categories_from_wb(wb)
-    category_history = collect_category_history_from_workbook(wb)
-    merged = merge_same_merchants(rows)
-    rules = load_category_rules()
-
-    for merchant, data in merged.items():
-        if merchant not in existing:
-            existing[merchant] = {m: [] for m in CREDIT_MONTHS}
-
-        new_parts = [normalize_amount_string(a) for a in data["amounts"]]
-        existing[merchant][selected_month_ui].extend(new_parts)
-
-    if DEBIT_SHEET_NAME in wb.sheetnames:
-        old_ws = wb[DEBIT_SHEET_NAME]
-        wb.remove(old_ws)
-
-    ws = wb.create_sheet(DEBIT_SHEET_NAME)
-
-    headers = ["Merchant"] + normalize_month_labels(month_labels) + ["Total", "Category"]
-    for col_idx, h in enumerate(headers, start=1):
-        ws.cell(row=1, column=col_idx, value=h)
-
-    merchants_sorted = sorted(existing.keys(), key=lambda x: x.strip().lower())
-
-    row_idx = 2
-    for merchant in merchants_sorted:
-        category = existing_categories.get(merchant, "")
-        if not category:
-            category, _, _ = get_smart_category_for_merchant(
-                merchant, rules, category_history
-            )
-
-        ws.cell(row=row_idx, column=1, value=merchant)
-
-        for month_i, month in enumerate(CREDIT_MONTHS, start=2):
-            parts = existing[merchant].get(month, [])
-            formula = build_plus_formula(parts)
-            if formula:
-                ws.cell(row=row_idx, column=month_i, value=formula)
-                ws.cell(row=row_idx, column=month_i).number_format = "0.00"
-            else:
-                ws.cell(row=row_idx, column=month_i, value=None)
-
-        ws.cell(row=row_idx, column=14, value=f"=SUM(B{row_idx}:M{row_idx})")
-        ws.cell(row=row_idx, column=14).number_format = "0.00"
-        ws.cell(row=row_idx, column=15, value=category)
-
-        row_idx += 1
-
-    total_row = row_idx
-    ws.cell(row=total_row, column=1, value="Total")
-
-    for col in range(2, 14):
-        col_letter = excel_col_letter(col)
-        if total_row == 2:
-            ws.cell(row=total_row, column=col, value=None)
-        else:
-            ws.cell(row=total_row, column=col, value=f"=SUM({col_letter}2:{col_letter}{total_row - 1})")
-            ws.cell(row=total_row, column=col).number_format = "0.00"
-
-    if total_row == 2:
-        ws.cell(row=total_row, column=14, value=None)
-    else:
-        ws.cell(row=total_row, column=14, value=f"=SUM(B{total_row}:M{total_row})")
-        ws.cell(row=total_row, column=14).number_format = "0.00"
-
-    ws.cell(row=total_row, column=15, value="")
-
-    style_debit_summary_sheet(ws, total_row)
-    sync_credit_debit_from_debit_sheet(wb)
-
-    if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
-        maybe_sheet = wb["Sheet"]
-        if maybe_sheet.max_row == 1 and maybe_sheet.max_column == 1 and maybe_sheet["A1"].value is None:
-            wb.remove(maybe_sheet)
-
-    wb.save(xlsx_path)
-
-
-# ================= Credit Summary 写入 =================
-
-def write_or_update_credit_summary_xlsx(
-        xlsx_path: Path,
-        rows,
-        selected_month_ui: str,
-        bank_name: str = DEFAULT_BANK_NAME
-):
-    selected_month_ui = selected_month_ui.upper().strip()
-    if selected_month_ui not in CREDIT_MONTHS:
-        selected_month_ui = "JAN"
-
-    if xlsx_path.exists():
-        wb = load_workbook(xlsx_path)
-    else:
-        wb = Workbook()
-        default_ws = wb.active
-        default_ws.title = "Sheet"
-
-    month_labels = read_month_labels_from_wb(wb)
-    old_bank_name, existing_dynamic_headers, existing_month_values = read_existing_credit_summary_from_wb(wb)
-    final_bank_name = (bank_name or "").strip() or old_bank_name or DEFAULT_BANK_NAME
-
-    new_rows_by_month = {m: [] for m in CREDIT_MONTHS}
-    new_rows_by_month[selected_month_ui] = list(rows)
-
-    month_values = build_credit_month_matrix(existing_month_values, new_rows_by_month)
-    dynamic_headers = collect_all_credit_headers(month_values, existing_dynamic_headers)
-
-    if "Credit Summary" in wb.sheetnames:
-        old_ws = wb["Credit Summary"]
-        wb.remove(old_ws)
-
-    ws = wb.create_sheet("Credit Summary", 0)
-
-    ws.cell(row=1, column=2, value=final_bank_name)
-
-    headers = [CREDIT_BEGIN_HEADER] + dynamic_headers + [
-        CREDIT_TOTAL_HEADER,
-        CREDIT_DEBIT_HEADER,
-        CREDIT_ENDING_HEADER,
-    ]
-
-    for idx, h in enumerate(headers, start=2):
-        ws.cell(row=2, column=idx, value=h)
-
-    for index, month in enumerate(CREDIT_MONTHS):
-        ws.cell(row=CREDIT_MONTH_ROWS[month], column=1, value=month_labels[index])
-
-    ws.cell(row=15, column=1, value="TOTAL")
-
-    header_col_map = {}
-    for col in range(2, len(headers) + 2):
-        header_col_map[str(ws.cell(row=2, column=col).value).strip()] = col
-
-    begin_col = header_col_map[CREDIT_BEGIN_HEADER]
-    total_credit_col = header_col_map[CREDIT_TOTAL_HEADER]
-    debit_col = header_col_map[CREDIT_DEBIT_HEADER]
-    ending_col = header_col_map[CREDIT_ENDING_HEADER]
-
-    for month in CREDIT_MONTHS:
-        row_idx = CREDIT_MONTH_ROWS[month]
-
-        for h in dynamic_headers:
-            raw_val = month_values.get(month, {}).get(h, None)
-            col_idx = header_col_map[h]
-
-            if raw_val is None or abs(safe_float(raw_val)) < 1e-12:
-                ws.cell(row=row_idx, column=col_idx, value=None)
-            else:
-                ws.cell(row=row_idx, column=col_idx, value=safe_float(raw_val))
-                ws.cell(row=row_idx, column=col_idx).number_format = "0.00"
-
-    jan_row = CREDIT_MONTH_ROWS["JAN"]
-    ws.cell(row=jan_row, column=begin_col, value=0)
-    ws.cell(row=jan_row, column=begin_col).number_format = "0.00"
-
-    for i in range(1, len(CREDIT_MONTHS)):
-        month = CREDIT_MONTHS[i]
-        prev_month = CREDIT_MONTHS[i - 1]
-
-        row_idx = CREDIT_MONTH_ROWS[month]
-        prev_row = CREDIT_MONTH_ROWS[prev_month]
-
-        prev_ending_ref = ws.cell(row=prev_row, column=ending_col).coordinate
-        ws.cell(row=row_idx, column=begin_col, value=f"={prev_ending_ref}")
-        ws.cell(row=row_idx, column=begin_col).number_format = "0.00"
-
-    dynamic_start_col = header_col_map[dynamic_headers[0]]
-    dynamic_end_col = header_col_map[dynamic_headers[-1]]
-
-    for month in CREDIT_MONTHS:
-        row_idx = CREDIT_MONTH_ROWS[month]
-        start_ref = ws.cell(row=row_idx, column=dynamic_start_col).coordinate
-        end_ref = ws.cell(row=row_idx, column=dynamic_end_col).coordinate
-
-        ws.cell(
-            row=row_idx,
-            column=total_credit_col,
-            value=f"=SUM({start_ref}:{end_ref})"
-        )
-        ws.cell(row=row_idx, column=total_credit_col).number_format = "0.00"
-
-    for month in CREDIT_MONTHS:
-        row_idx = CREDIT_MONTH_ROWS[month]
-        ws.cell(row=row_idx, column=debit_col, value=None)
-
-    for month in CREDIT_MONTHS:
-        row_idx = CREDIT_MONTH_ROWS[month]
-
-        begin_ref = ws.cell(row=row_idx, column=begin_col).coordinate
-        total_credit_ref = ws.cell(row=row_idx, column=total_credit_col).coordinate
-        debit_ref = ws.cell(row=row_idx, column=debit_col).coordinate
-
-        ws.cell(
-            row=row_idx,
-            column=ending_col,
-            value=f"={begin_ref}+{total_credit_ref}-{debit_ref}"
-        )
-        ws.cell(row=row_idx, column=ending_col).number_format = "0.00"
-
-    total_row = 15
-    ws.cell(row=total_row, column=begin_col, value=None)
-
-    for h in dynamic_headers:
-        col_idx = header_col_map[h]
-        start_ref = ws.cell(row=CREDIT_MONTH_ROWS["JAN"], column=col_idx).coordinate
-        end_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=col_idx).coordinate
-        ws.cell(row=total_row, column=col_idx, value=f"=SUM({start_ref}:{end_ref})")
-        ws.cell(row=total_row, column=col_idx).number_format = "0.00"
-
-    start_ref = ws.cell(row=CREDIT_MONTH_ROWS["JAN"], column=total_credit_col).coordinate
-    end_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=total_credit_col).coordinate
-    ws.cell(row=total_row, column=total_credit_col, value=f"=SUM({start_ref}:{end_ref})")
-    ws.cell(row=total_row, column=total_credit_col).number_format = "0.00"
-
-    ws.cell(row=total_row, column=debit_col, value=None)
-
-    dec_ending_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=ending_col).coordinate
-    ws.cell(row=total_row, column=ending_col, value=f"={dec_ending_ref}")
-    ws.cell(row=total_row, column=ending_col).number_format = "0.00"
-
-    last_col = 1 + len(headers)
-    style_credit_sheet(ws, last_col)
-    ws.auto_filter.ref = f"A2:{excel_col_letter(last_col)}15"
-
-    sync_credit_debit_from_debit_sheet(wb)
-
-    if DEBIT_SHEET_NAME not in wb.sheetnames:
-        start_ref = ws.cell(row=CREDIT_MONTH_ROWS["JAN"], column=debit_col).coordinate
-        end_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=debit_col).coordinate
-        ws.cell(row=15, column=debit_col, value=f"=SUM({start_ref}:{end_ref})")
-        ws.cell(row=15, column=debit_col).number_format = "0.00"
-
-    if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
-        maybe_sheet = wb["Sheet"]
-        if maybe_sheet.max_row == 1 and maybe_sheet.max_column == 1 and maybe_sheet["A1"].value is None:
-            wb.remove(maybe_sheet)
-
-    wb.save(xlsx_path)
 
 
 # ================= 已有公司报表模板导入 =================
@@ -1855,6 +1370,48 @@ def retarget_cross_sheet_row_references(wb, sheet_name: str, old_row: int, new_r
                 if count:
                     cell.value = new_value
                     updated += 1
+    return updated
+
+
+def retarget_local_row_references(ws, old_row: int, new_row: int) -> int:
+    """Repair SAME-SHEET formulas that reference a specific row after that row
+    moved (e.g. a Debit sheet's Total row, after merging duplicate merchants
+    deleted rows above it, or after inserting a new merchant row pushed it
+    down).
+
+    Some Debit templates have extra summary rows below Total -- typically
+    labeled BEGIN / ADD / LESS / END (case-insensitive, e.g. "Add" or "ADD")
+    -- whose formulas pull directly from the Total row's own cells, e.g. a
+    plain ``=B14`` sitting in the "ADD" row. Deleting duplicate merchant rows,
+    or inserting a brand-new merchant row, moves Total up or down, but
+    openpyxl does not rewrite this kind of plain local formula reference on
+    its own, so it silently keeps reading the row that used to be Total (now
+    something else, or blank). This finds every formula cell containing a
+    bare column+old_row reference -- never a cross-sheet reference such as
+    ='Sheet'!B14, which is handled separately by
+    retarget_cross_sheet_row_references -- and rewrites just the row number,
+    keeping the column letter and any $ anchors intact. Row labels ("ADD",
+    "BEGIN", etc.) are never inspected, only the actual cell formulas, so this
+    works no matter what a template calls that row or how it is capitalized.
+    """
+    if old_row == new_row or old_row is None or new_row is None:
+        return 0
+
+    # (?<!!) excludes a reference immediately preceded by "!" -- that would be
+    # the tail end of a cross-sheet reference like ='Sheet'!B14, which must be
+    # left for retarget_cross_sheet_row_references to handle instead.
+    ref_re = re.compile(rf"(?<!!)(\$?[A-Z]{{1,3}}\$?){old_row}\b")
+
+    updated = 0
+    for row_cells in ws.iter_rows():
+        for cell in row_cells:
+            value = cell.value
+            if not isinstance(value, str) or not value.lstrip().startswith("="):
+                continue
+            new_value, count = ref_re.subn(rf"\g<1>{new_row}", value)
+            if count:
+                cell.value = new_value
+                updated += 1
     return updated
 
 
@@ -2200,8 +1757,9 @@ def create_credit_template_sheet(wb, income_headers: List[str], bank_name: str, 
     end_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=debit_col).coordinate
     ws.cell(row=15, column=debit_col, value=f"=SUM({start_ref}:{end_ref})")
 
-    dec_ending_ref = ws.cell(row=CREDIT_MONTH_ROWS["DEC"], column=ending_col).coordinate
-    ws.cell(row=15, column=ending_col, value=f"={dec_ending_ref}")
+    # TOTAL row intentionally leaves BOTH Begin and Ending untouched -- only
+    # the columns strictly between them get a value here. The user fills
+    # Ending in manually, so this must never write to it.
 
     last_col = 1 + len(headers)
     style_credit_sheet(ws, last_col)
@@ -2343,8 +1901,9 @@ def clear_credit_amounts_keep_layout(ws) -> int:
         start_ref = ws.cell(row=first_data_row, column=col).coordinate
         end_ref = ws.cell(row=last_data_row, column=col).coordinate
         ws.cell(row=total_row, column=col, value=f"=SUM({start_ref}:{end_ref})")
-    ws.cell(row=total_row, column=ending_col,
-            value=f"={ws.cell(row=last_data_row, column=ending_col).coordinate}")
+    # TOTAL row intentionally leaves BOTH Begin and Ending untouched -- only
+    # the columns strictly between them get a value here. The user fills
+    # Ending in manually, so this must never write to it.
     return len(dynamic_cols)
 
 
@@ -2985,14 +2544,23 @@ def rebuild_credit_total_row_formulas(ws):
       - The TOTAL label is also in Column A.
       - Column B is BEGIN BALANCE and is not changed here.
       - Row immediately above the first Month/date row is the header row.
+      - TOTAL CREDIT is always exactly 2 columns before ENDING BALANCE (the
+        rightmost populated header), with DEBIT directly in between. Each
+        period row's own Total Credit cell is rebuilt to SUM every dynamic
+        column for that row (column 3 through the column right before Total
+        Credit) -- this must be redone every time rather than trusted from
+        whatever was written before, since inserting a new merchant column
+        only shifts existing cells positionally and never rewrites another
+        cell's formula text, so a stale Total Credit formula would otherwise
+        keep summing only its original narrow range forever.
       - Every populated header column strictly between Begin (column B) and
-        Ending (the rightmost populated header) receives a normal vertical
-        SUM formula over the full Month/date row range. Ending itself is
-        never summed -- it is set to reference the final period's Ending
-        value, since summing 12 running balances is meaningless. Both
-        boundaries are found purely by position, never by matching header
-        text such as "Begin"/"Ending", since real templates word these
-        differently.
+        Ending (the rightmost populated header) also receives a normal
+        vertical SUM formula in the bottom TOTAL row, over the full
+        Month/date row range. Both Begin and Ending themselves are left
+        completely untouched in the TOTAL row -- the user fills these in
+        manually. All boundaries are found purely by position, never by
+        matching header text such as "Begin"/"Ending"/"Total Credit", since
+        real templates word these differently.
 
     ``openpyxl.insert_cols`` moves cells but does not reliably translate every
     existing formula reference. Recreating this row after all Credit writes
@@ -3042,17 +2610,37 @@ def rebuild_credit_total_row_formulas(ws):
 
     # Position-based rule, never text-based (header wording for Begin/Ending
     # varies by template -- e.g. "Begin" vs "BEGIN BALANCE"): Column B is
-    # always BEGIN and stays untouched here (a "total of monthly begin
-    # balances" has no accounting meaning). By this program's fixed Credit
-    # column order, ENDING BALANCE is always written as the LAST column, so
-    # the rightmost populated header found above is always Ending -- whatever
-    # it happens to be named. Its Total-row cell must reference the final
-    # period's Ending value rather than being summed (summing 12 running
-    # balances is meaningless). Every column strictly between Begin and
-    # Ending (the dynamic income columns, TOTAL CREDIT, DEBIT) gets a normal
-    # vertical SUM -- this is the fix for "Total 行没有把 Begin 和 Ending
-    # 之间的都加总".
+    # always BEGIN and Ending (the rightmost populated header, whatever it is
+    # named) are BOTH left untouched by the TOTAL row -- the user fills these
+    # in manually. Only every column strictly between Begin and Ending (the
+    # dynamic income columns, TOTAL CREDIT, DEBIT) gets a normal vertical SUM.
     ending_col = last_header_col
+
+    # Total Credit is always exactly 2 columns before Ending (Debit sits
+    # directly in between: ... TOTAL CREDIT, DEBIT, ENDING BALANCE), the same
+    # fixed header order this program always writes -- so this holds
+    # regardless of header wording.
+    total_credit_col = ending_col - 2
+
+    # Each period row's OWN "Total Credit" formula (e.g. row 3's =SUM(C3:E3))
+    # must also be rebuilt every time, not left as whatever static text
+    # happened to be written once. Inserting a new merchant column
+    # (ws.insert_cols) only shifts cells positionally -- it never rewrites
+    # formula TEXT elsewhere -- so a per-row Total Credit formula silently
+    # keeps summing only its original narrow range forever, excluding every
+    # merchant column added afterward. Rebuilding it here from the current
+    # first-dynamic-column through the column right before Total Credit fixes
+    # that for every period row, every time.
+    if total_credit_col > 3:
+        first_dynamic_col = 3
+        last_dynamic_col = total_credit_col - 1
+        for row in period_rows:
+            start_ref = ws.cell(row=row, column=first_dynamic_col).coordinate
+            end_ref = ws.cell(row=row, column=last_dynamic_col).coordinate
+            total_credit_cell = ws.cell(row=row, column=total_credit_col)
+            total_credit_cell.value = f"=SUM({start_ref}:{end_ref})"
+            total_credit_cell.number_format = "0.00"
+
     for col in range(3, ending_col):
         col_letter = excel_col_letter(col)
         total_cell = ws.cell(row=total_row, column=col)
@@ -3062,11 +2650,8 @@ def rebuild_credit_total_row_formulas(ws):
         )
         total_cell.number_format = "0.00"
 
-    ending_letter = excel_col_letter(ending_col)
-    last_period_ending_ref = f"{ending_letter}{last_period_row}"
-    ending_total_cell = ws.cell(row=total_row, column=ending_col)
-    ending_total_cell.value = f"={last_period_ending_ref}"
-    ending_total_cell.number_format = "0.00"
+    # Ending is intentionally left untouched here -- the user fills the TOTAL
+    # row's Ending cell in manually.
 
 
 def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: str = DEFAULT_BANK_NAME):
@@ -3097,7 +2682,7 @@ def update_credit_sheet_in_place(ws, rows, selected_period_row: int, bank_name: 
 
     # Optional bank name: only write to the top-left writable cell of Row 1,
     # Column B (the same convention used everywhere else in this program,
-    # e.g. create_credit_template_sheet / write_or_update_credit_summary_xlsx).
+    # e.g. create_credit_template_sheet).
     if bank_name:
         try:
             safe_set_merged_value(ws, 1, begin_col, bank_name)
@@ -3254,6 +2839,14 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
     # references the old Total row position.
     if old_total_row is not None and old_total_row != total_row:
         retarget_cross_sheet_row_references(ws.parent, ws.title, old_total_row, total_row)
+        # Some Debit templates also have a summary row directly below Total
+        # -- commonly labeled "Add" / "ADD" (or Begin/Less/End) -- whose
+        # formula reads Total's own cells directly (e.g. a plain "=B14").
+        # That is a SAME-SHEET reference, so it must be repaired separately
+        # from the cross-sheet fix above; otherwise it keeps pointing at the
+        # row Total used to occupy before this new merchant row pushed it
+        # down, and silently shows stale or blank numbers.
+        retarget_local_row_references(ws, old_total_row, total_row)
 
 
 def append_rows_to_selected_sheet(
@@ -3361,6 +2954,23 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
         if not period_cols:
             raise ValueError("当前Excel Sheet中找不到可合并的月份或日期列。")
 
+        # Some templates have an extra recognizable period/date column placed
+        # AFTER Total/Category (e.g. a freshly added "Apr-26" column for next
+        # year -- see find_extra_debit_period_columns). Total/SUM formulas
+        # intentionally never include these columns (that rule is unchanged
+        # below), but the actual per-row transaction VALUES stored in them
+        # still belong to that merchant and must be combined the same way as
+        # any other period column when two rows for the same Merchant get
+        # merged into one. period_cols alone (used for Total) does NOT include
+        # these trailing columns, so relying on it for the merge step was the
+        # bug: a duplicate row's amount in a trailing column like this was
+        # silently discarded the moment the duplicate row got deleted below.
+        extra_period_cols = (
+            find_extra_debit_period_columns(ws, category_col)
+            if category_col is not None else []
+        )
+        merge_cols = sorted(set(period_cols) | set(extra_period_cols))
+
         # 明细区域截止到 Merchant 列中的 Total 行之前。
         summary_row = None
         for row in range(header_row + 1, ws.max_row + 1):
@@ -3371,7 +2981,8 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
         data_end_row = summary_row - 1 if summary_row else ws.max_row
 
         # 先做完整快照。不能一边读取一边删除，否则 Category 后面的期间数据
-        # 可能跟随重复行一起被删除。
+        # 可能跟随重复行一起被删除。快照范围是 merge_cols（真正的期间列 +
+        # Category 后面的额外期间列），而不只是参与 Total 求和的 period_cols。
         groups = OrderedDict()
         for row in range(header_row + 1, data_end_row + 1):
             merchant_value = ws.cell(row=row, column=merchant_col).value
@@ -3384,11 +2995,11 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
                 groups[key] = {
                     "keeper": row,
                     "rows": [],
-                    "period_values": {col: [] for col in period_cols},
+                    "period_values": {col: [] for col in merge_cols},
                 }
 
             groups[key]["rows"].append(row)
-            for col in period_cols:
+            for col in merge_cols:
                 # 保存原始值/公式；此时尚未删除任何行。
                 groups[key]["period_values"][col].append(
                     ws.cell(row=row, column=col).value
@@ -3397,7 +3008,7 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
         duplicate_rows = []
         merged_groups = 0
 
-        # 先把每一组的所有期间数据写入保留行。
+        # 先把每一组的所有期间数据写入保留行，包含 Category 后面的额外期间列。
         for data in groups.values():
             rows = data["rows"]
             if len(rows) <= 1:
@@ -3407,7 +3018,7 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
             keep_row = data["keeper"]
             duplicate_rows.extend(rows[1:])
 
-            for col in period_cols:
+            for col in merge_cols:
                 all_parts = []
                 for value in data["period_values"][col]:
                     all_parts.extend(split_formula_parts(value))
@@ -3415,7 +3026,8 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
                         build_plus_formula(all_parts) or None
                 )
 
-            # Total 只计算真正的期间列，不包含 Category。
+            # Total 只计算真正参与聚合的期间列 (period_cols)；Category 后面
+            # 的额外期间列按既定规则永远不计入 Total/SUM，这一点保持不变。
             ws.cell(row=keep_row, column=total_col).value = build_sum_formula_for_columns(
                 ws, keep_row, period_cols
             )
@@ -3458,6 +3070,11 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
         # will keep reading a stale/empty row after the merge.
         if summary_row is not None and new_summary_row is not None:
             retarget_cross_sheet_row_references(wb, sheet_name, summary_row, new_summary_row)
+            # Some templates also have extra summary rows below Total (BEGIN /
+            # ADD / LESS / END) whose formulas pull directly from Total's own
+            # cells (e.g. a plain =B14 in the "ADD" row). Those same-sheet
+            # references need the same repair.
+            retarget_local_row_references(ws, summary_row, new_summary_row)
 
         wb.save(xlsx_path)
         return {
