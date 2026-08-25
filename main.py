@@ -3,7 +3,7 @@ import csv
 import sys
 from difflib import SequenceMatcher
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -588,6 +588,1086 @@ def script_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+# ============================================================================
+# 原始数据预处理引擎（内置）
+# ============================================================================
+#
+# 负责把顺序混乱的原始账单整理成本程序能直接解析的格式，每次 Start 都会
+# 先跑一遍。它能处理的杂乱形态包括：
+#
+#   商户在前 / 日期在后      AMAZON.COM 04/22 125.00
+#   金额穿插在中间           125.00 AMAZON.COM 04/22
+#   一笔拆成多行             AMAZON.COM \n 04/22 \n 125.00
+#   多笔挤成一整行           04/22 A 9.99 04/23 B 19.99 04/24 C 29.99
+#   行尾还带余额列           04/22 AMAZON 125.00 4,875.00
+#   夹杂表头/小计/页码行
+#
+# 核心思路是不假设日期、商户、金额的先后顺序，而是按特征强弱逐层剥离：
+# 先找出金额并遮蔽（金额特征最强：两位小数、千分位、$ 符号），再在剩余
+# 文本里找日期，最后剩下的文字就是商户。先遮蔽金额这一步很关键，否则
+# "5.12" 这类金额会被误判成 5 月 12 日。
+#
+# 整理结果统一输出成零填充的 MM/DD，正好是本程序默认日期规则识别的格式。
+
+
+# ==================== 月份名称 ====================
+
+MONTH_WORD_PATTERN = (
+    r"(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|"
+    r"JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|"
+    r"OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)"
+)
+
+MONTH_NAME_TO_NUMBER = {
+    "JAN": 1, "JANUARY": 1,
+    "FEB": 2, "FEBRUARY": 2,
+    "MAR": 3, "MARCH": 3,
+    "APR": 4, "APRIL": 4,
+    "MAY": 5,
+    "JUN": 6, "JUNE": 6,
+    "JUL": 7, "JULY": 7,
+    "AUG": 8, "AUGUST": 8,
+    "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10,
+    "NOV": 11, "NOVEMBER": 11,
+    "DEC": 12, "DECEMBER": 12,
+}
+
+
+def month_name_to_number(name: str) -> Optional[int]:
+    return MONTH_NAME_TO_NUMBER.get(str(name or "").strip().upper().rstrip("."))
+
+
+# ==================== 金额识别 ====================
+
+# 金额分两种写法分别匹配，然后合并去重：
+#
+#   A 型：带 $ 符号。有 $ 就足以确认是金额，因此小数部分可以省略（$125）。
+#   B 型：不带 $ 符号。必须有两位小数（125.00）或千分位逗号（5,000），
+#         否则一个孤立的 "125" 无法与参考号/单据号区分，宁可不认。
+#
+# 两种都支持负号在前（-125.00）、负号在后（125.00-）、括号表示负数
+# （(125.00)）以及 CR / DR 后缀，这些都是真实账单里常见的写法。
+
+_AMOUNT_WITH_DOLLAR_RE = re.compile(
+    r"(?P<open>\()?\s*"
+    r"(?P<sign1>[-+])?\s*"
+    r"\$\s*"
+    r"(?P<num>\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)"
+    r"\s*(?P<sign2>-)?"
+    r"\s*(?P<close>\))?"
+    r"(?:\s*(?P<crdr>CR|DR)\b)?",
+    re.IGNORECASE,
+)
+
+_AMOUNT_PLAIN_RE = re.compile(
+    r"(?<![\w.,])"
+    r"(?P<open>\()?\s*"
+    r"(?P<sign1>[-+])?\s*"
+    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+\.\d{2})"
+    r"\s*(?P<sign2>-)?"
+    r"\s*(?P<close>\))?"
+    r"(?:\s*(?P<crdr>CR|DR)\b)?"
+    r"(?![\d.])",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class AmountHit:
+    start: int
+    end: int
+    raw: str
+    value: float
+
+
+def _amount_value_from_match(m) -> Optional[float]:
+    num_text = (m.group("num") or "").replace(",", "").strip()
+    if not num_text:
+        return None
+    try:
+        value = float(num_text)
+    except ValueError:
+        return None
+
+    negative = False
+    if m.group("open") and m.group("close"):
+        negative = True
+    if m.group("sign1") == "-":
+        negative = True
+    if m.group("sign2") == "-":
+        negative = True
+    crdr = (m.group("crdr") or "").upper()
+    if crdr == "DR":
+        # DR = Debit，账单上通常表示扣款。CR = Credit 保持正数。
+        negative = True
+
+    return -value if negative else value
+
+
+def find_amounts(text: str) -> List[AmountHit]:
+    """找出一段文字里所有的金额，按出现位置排序，互不重叠。"""
+    hits: List[AmountHit] = []
+    taken: List[Tuple[int, int]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(not (end <= s or start >= e) for s, e in taken)
+
+    # 带 $ 的优先，避免 "$5,000" 被 B 型规则拆成别的结果。
+    for regex in (_AMOUNT_WITH_DOLLAR_RE, _AMOUNT_PLAIN_RE):
+        for m in regex.finditer(text):
+            value = _amount_value_from_match(m)
+            if value is None:
+                continue
+            start, end = m.start(), m.end()
+            if overlaps(start, end):
+                continue
+            taken.append((start, end))
+            hits.append(AmountHit(start, end, m.group(0).strip(), value))
+
+    hits.sort(key=lambda h: h.start)
+    return hits
+
+
+# ==================== 日期识别 ====================
+
+@dataclass
+class DateHit:
+    start: int
+    end: int
+    raw: str
+    month: int
+    day: int
+    year: Optional[int] = None
+
+
+def _normalize_two_digit_year(year_text: str) -> Optional[int]:
+    text = str(year_text or "").strip()
+    if not text.isdigit():
+        return None
+    if len(text) == 4:
+        return int(text)
+    if len(text) == 2:
+        # 两位年份统一按 20xx 解释；账单基本不会出现 19xx。
+        return 2000 + int(text)
+    return None
+
+
+def _valid_month_day(month: int, day: int) -> bool:
+    return 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _resolve_numeric_month_day(
+        first: int, second: int, day_first_mode: str
+) -> Optional[Tuple[int, int]]:
+    """把两个数字解释成 (月, 日)。
+
+    day_first_mode:
+      "auto"       先按月/日理解；月份不可能大于 12，因此当第一个数字 > 12
+                   而第二个 <= 12 时自动改判为 日/月。
+      "month_first" 永远按 月/日 理解（美国账单常见）。
+      "day_first"   永远按 日/月 理解（欧洲/部分国际账单）。
+    """
+    if day_first_mode == "day_first":
+        month, day = second, first
+        return (month, day) if _valid_month_day(month, day) else None
+
+    if day_first_mode == "month_first":
+        month, day = first, second
+        return (month, day) if _valid_month_day(month, day) else None
+
+    # auto
+    if _valid_month_day(first, second):
+        return first, second
+    if _valid_month_day(second, first):
+        return second, first
+    return None
+
+
+def build_date_patterns(allow_dot_separator: bool,
+                        allow_compact_mmdd: bool = False) -> List[Tuple[str, re.Pattern]]:
+    """按优先级返回日期正则。
+
+    三段式（含年份）必须排在两段式前面，否则 "04/22/25" 会被先切成 "04/22"。
+
+    是否允许用点号作为日期分隔符由调用方决定：账单里 "4.22" 既可能是日期
+    也可能是金额，默认关闭以免误判，需要时可在界面上打开。
+
+    allow_compact_mmdd 控制是否识别没有分隔符的四位日期，例如美国银行
+    "CHECKCARD 0422 AMAZON.COM" 这种写法。这个规则默认关闭：任何一个四位
+    数字（单据号、门店号）都可能碰巧长得像 MMDD，开启后误判风险明显更高，
+    因此交给用户按自己账单的实际格式决定。开启时也要求严格零填充
+    （0422 可以，422 不行），把误判面压到最小。
+    """
+    sep = r"[-/.]" if allow_dot_separator else r"[-/]"
+
+    patterns = [
+        # 2025-04-22 / 2025/4/22
+        ("iso", re.compile(rf"(?<!\d)(\d{{4}}){sep}(\d{{1,2}}){sep}(\d{{1,2}})(?!\d)")),
+        # 04/22/25 / 4-22-2025
+        ("mdy", re.compile(rf"(?<!\d)(\d{{1,2}}){sep}(\d{{1,2}}){sep}(\d{{2,4}})(?!\d)")),
+        # Apr 22 2025 / April 22, 2025 / Apr-22-25
+        ("word_day", re.compile(
+            rf"\b({MONTH_WORD_PATTERN})\.?[\s,\-/]+(\d{{1,2}})"
+            rf"(?:[\s,\-/]+(\d{{2,4}})(?!\d))?",
+            re.IGNORECASE)),
+        # 22 Apr 2025 / 22-Apr-25
+        ("day_word", re.compile(
+            rf"(?<!\d)(\d{{1,2}})[\s,\-/]*({MONTH_WORD_PATTERN})\.?"
+            rf"(?:[\s,\-/]+(\d{{2,4}})(?!\d))?",
+            re.IGNORECASE)),
+        # 04/22 / 4-22
+        ("md", re.compile(rf"(?<!\d)(\d{{1,2}}){sep}(\d{{1,2}})(?!\d)")),
+    ]
+
+    if allow_compact_mmdd:
+        # 0422 -> 4 月 22 日。必须严格零填充的四位，且左右不能再有数字。
+        patterns.append(
+            ("mmdd", re.compile(r"(?<!\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)"))
+        )
+
+    return patterns
+
+
+def find_dates(text: str, day_first_mode: str = "auto",
+               allow_dot_separator: bool = False,
+               allow_compact_mmdd: bool = False) -> List[DateHit]:
+    """找出一段文字里所有的日期，按位置排序，互不重叠。
+
+    调用前建议先用 mask_spans() 把金额位置遮蔽掉，否则 "5.12" 这类
+    金额可能被当成 5 月 12 日。
+    """
+    hits: List[DateHit] = []
+    taken: List[Tuple[int, int]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(not (end <= s or start >= e) for s, e in taken)
+
+    for kind, regex in build_date_patterns(allow_dot_separator, allow_compact_mmdd):
+        for m in regex.finditer(text):
+            start, end = m.start(), m.end()
+            if overlaps(start, end):
+                continue
+
+            month = day = None
+            year = None
+
+            if kind == "iso":
+                year = int(m.group(1))
+                month, day = int(m.group(2)), int(m.group(3))
+                if not _valid_month_day(month, day):
+                    continue
+
+            elif kind == "mdy":
+                resolved = _resolve_numeric_month_day(
+                    int(m.group(1)), int(m.group(2)), day_first_mode
+                )
+                if resolved is None:
+                    continue
+                month, day = resolved
+                year = _normalize_two_digit_year(m.group(3))
+
+            elif kind == "word_day":
+                month = month_name_to_number(m.group(1))
+                day = int(m.group(2))
+                if month is None or not _valid_month_day(month, day):
+                    continue
+                if m.group(3):
+                    year = _normalize_two_digit_year(m.group(3))
+
+            elif kind == "day_word":
+                day = int(m.group(1))
+                month = month_name_to_number(m.group(2))
+                if month is None or not _valid_month_day(month, day):
+                    continue
+                if m.group(3):
+                    year = _normalize_two_digit_year(m.group(3))
+
+            elif kind == "md":
+                resolved = _resolve_numeric_month_day(
+                    int(m.group(1)), int(m.group(2)), day_first_mode
+                )
+                if resolved is None:
+                    continue
+                month, day = resolved
+
+            elif kind == "mmdd":
+                # 无分隔符写法只按 MMDD 解释，不做月/日互换猜测。
+                month, day = int(m.group(1)), int(m.group(2))
+                if not _valid_month_day(month, day):
+                    continue
+
+            if month is None or day is None:
+                continue
+
+            taken.append((start, end))
+            hits.append(DateHit(start, end, m.group(0).strip(), month, day, year))
+
+    hits.sort(key=lambda h: h.start)
+    return hits
+
+
+def mask_spans(text: str, spans: List[Tuple[int, int]]) -> str:
+    """把指定区间替换成等长空格，保持其余字符的下标不变。"""
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in spans:
+        for i in range(max(0, start), min(len(chars), end)):
+            chars[i] = " "
+    return "".join(chars)
+
+
+# ==================== 商户名清洗 ====================
+
+# 常见噪音：参考号、卡号尾号、授权码、网址、电话等。
+NOISE_PATTERNS = [
+    re.compile(r"\bREF\s*#?\s*[:#]?\s*[\w-]+", re.IGNORECASE),
+    re.compile(r"\bTRACE\s*#?\s*[:#]?\s*[\w-]+", re.IGNORECASE),
+    re.compile(r"\bCONF(?:IRMATION)?\s*#?\s*[:#]?\s*[\w-]+", re.IGNORECASE),
+    re.compile(r"\bAUTH\s*#?\s*[:#]?\s*[\w-]+", re.IGNORECASE),
+    re.compile(r"\bCARD\s*#?\s*\d{2,}", re.IGNORECASE),
+    re.compile(r"\bX{2,}\d{2,}\b", re.IGNORECASE),
+    re.compile(r"\*{2,}\d{2,}\b"),
+    re.compile(r"https?://\S+", re.IGNORECASE),
+    re.compile(r"\bwww\.\S+", re.IGNORECASE),
+    re.compile(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b"),          # 电话
+    re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b"),               # 邮箱
+]
+
+
+def clean_merchant_text(text: str, remove_noise: bool = False,
+                        remove_items: Optional[List[str]] = None) -> str:
+    """整理商户名：去掉标记后缀、可选噪音、用户指定关键词，并规范空白。"""
+    result = " ".join(str(text or "").split())
+    if not result:
+        return ""
+
+    # 用户自定义要删除的关键词（与主程序"预处理删除内容"用途一致）。
+    for item in (remove_items or []):
+        item = str(item).strip()
+        if item:
+            result = re.compile(re.escape(item), re.IGNORECASE).sub(" ", result)
+
+    if remove_noise:
+        for pattern in NOISE_PATTERNS:
+            result = pattern.sub(" ", result)
+
+    result = " ".join(result.split())
+
+    # 与主程序一致：遇到 DES: / ID: / INDN: / CO ID: 就截断。
+    upper = result.upper()
+    for token in MERCHANT_CUT_TOKENS:
+        idx = upper.find(token)
+        if idx != -1:
+            result = result[:idx]
+            upper = result.upper()
+
+    # 去掉首尾多余的标点和分隔符号。
+    result = result.strip(" \t-–—|,;:*#.")
+    return " ".join(result.split())
+
+
+# ==================== 需要跳过的非交易行 ====================
+
+DEFAULT_SKIP_KEYWORDS = [
+    "beginning balance",
+    "ending balance",
+    "previous balance",
+    "new balance",
+    "statement balance",
+    "balance forward",
+    "total deposits",
+    "total withdrawals",
+    "total credits",
+    "total debits",
+    "daily balance",
+    "minimum payment",
+    "payment due",
+    "statement period",
+    "account summary",
+    "page ",
+    "continued",
+    "date description",
+    "transaction detail",
+    "posting date",
+]
+
+
+def looks_like_skippable_line(line: str, skip_keywords: List[str],
+                              day_first_mode: str = "auto",
+                              allow_dot_separator: bool = False,
+                              allow_compact_mmdd: bool = False) -> bool:
+    """判断一行是不是表头 / 小计 / 页码之类的非交易行。
+
+    这一步很重要：像 "Beginning Balance   5,000.00" 这种行含有金额但没有
+    交易含义，如果不剔除，它的金额可能被错误地和后面某一行的日期拼成一条
+    假交易。
+    """
+    text = " ".join(str(line or "").split()).lower()
+    if not text:
+        return True
+
+    for keyword in skip_keywords:
+        keyword = str(keyword).strip().lower()
+        if keyword and keyword in text:
+            return True
+
+    # 纯页码行，例如 "1 / 5"。
+    #
+    # 注意：这条规则必须先排除掉真正的日期行和金额行。原始数据被逐行拆开时
+    # （PDF 复制常见），日期会单独占一行，例如只有 "04/22" 五个字符 —— 它同样
+    # 由数字和斜杠组成、长度也很短，如果不做保护就会被当成页码整行丢掉，
+    # 那条交易就再也拼不回来了。
+    if re.fullmatch(r"[\d\s/of\-]+", text) and len(text) <= 12:
+        raw = str(line or "")
+        amount_hits = find_amounts(raw)
+        masked = mask_spans(raw, [(h.start, h.end) for h in amount_hits])
+        date_hits = find_dates(
+            masked,
+            day_first_mode=day_first_mode,
+            allow_dot_separator=allow_dot_separator,
+            allow_compact_mmdd=allow_compact_mmdd,
+        )
+        if not date_hits and not amount_hits:
+            return True
+
+    return False
+
+
+# ==================== 数据结构 ====================
+
+@dataclass
+class Item:
+    """一行文本被拆解出来的最小单元：日期 / 金额 / 文字。
+
+    line_no 是【分组键】，不一定等于原始行号：当一行里连着挤了好几笔交易时
+    （见 split_compact_line_items），这一行会被切成多段，每段拿到各自独立的
+    分组键，这样后续组装逻辑就能像处理普通多行数据一样处理它们。
+    origin_line 始终保存真实的原始行号，只用于错误提示。
+    """
+    kind: str          # 'date' | 'amount' | 'text'
+    line_no: int       # 分组键（同一段落内的单元共享）
+    raw: str
+    date: Optional[DateHit] = None
+    amount: Optional[float] = None
+    origin_line: int = 0
+
+
+@dataclass
+class Record:
+    date: Optional[DateHit] = None
+    amount: Optional[float] = None
+    merchant_parts: List[str] = field(default_factory=list)
+    line_nos: List[int] = field(default_factory=list)     # 原始行号，用于提示
+    group_keys: List[int] = field(default_factory=list)   # 分组键，用于同段判断
+    last_group_key: Optional[int] = None
+
+    @property
+    def merchant_raw(self) -> str:
+        return " ".join(p for p in self.merchant_parts if p.strip())
+
+    def is_empty(self) -> bool:
+        return (self.date is None and self.amount is None
+                and not self.merchant_raw.strip())
+
+    def is_complete(self) -> bool:
+        return (self.date is not None and self.amount is not None
+                and bool(self.merchant_raw.strip()))
+
+
+@dataclass
+class Transaction:
+    date: DateHit
+    merchant: str
+    amount: float
+    source_lines: List[int]
+
+
+@dataclass
+class Issue:
+    line_nos: List[int]
+    reason: str
+    content: str
+
+
+@dataclass
+class ProcessOptions:
+    # 日期解释
+    day_first_mode: str = "auto"          # auto | month_first | day_first
+    allow_dot_separator: bool = False     # 是否把 4.22 也当作日期
+    allow_compact_mmdd: bool = False      # 是否把无分隔符的 0422 也当作日期
+    default_year: str = ""                # 原始数据没有年份时补充的年份
+
+    # 日期输出格式（默认 MM/DD，主程序默认设置即可识别）
+    date_output_format: str = "MM/DD"     # KEEP | MM/DD | MM/DD/YY | MM/DD/YYYY
+
+    # 金额处理
+    balance_column_mode: str = "auto"     # auto | none | last_is_balance
+    amount_sign_mode: str = "keep"        # keep | abs | negative
+
+    # 商户处理
+    remove_noise: bool = False
+    remove_items: List[str] = field(default_factory=list)
+
+    # 行过滤
+    skip_keywords: List[str] = field(default_factory=lambda: list(DEFAULT_SKIP_KEYWORDS))
+
+    # 输出格式
+    output_style: str = "two_line"        # two_line | one_line
+
+    # 一条记录最多允许跨几行
+    max_record_span: int = 4
+
+
+@dataclass
+class ProcessResult:
+    transactions: List[Transaction] = field(default_factory=list)
+    issues: List[Issue] = field(default_factory=list)
+    skipped_lines: List[Tuple[int, str]] = field(default_factory=list)
+    balance_column_detected: bool = False
+    hints: List[str] = field(default_factory=list)
+    output_text: str = ""
+    total_amount: float = 0.0
+
+
+# ==================== 行拆解 ====================
+
+def tokenize_line(line: str, line_no: int, options: ProcessOptions) -> List[Item]:
+    """把一行文本按出现顺序拆成 日期 / 金额 / 文字 单元。
+
+    顺序很关键：先识别金额并遮蔽，再识别日期，最后剩下的才是文字。
+    正因为最终是按【出现位置】排序输出，所以商户在前、日期在后这类
+    顺序颠倒的数据也能被后续组装逻辑正确处理。
+    """
+    text = line.replace("\t", "  ")
+    if not text.strip():
+        return []
+
+    amount_hits = find_amounts(text)
+    masked = mask_spans(text, [(h.start, h.end) for h in amount_hits])
+    date_hits = find_dates(
+        masked,
+        day_first_mode=options.day_first_mode,
+        allow_dot_separator=options.allow_dot_separator,
+        allow_compact_mmdd=options.allow_compact_mmdd,
+    )
+
+    spans: List[Tuple[int, int, str, object]] = []
+    for h in amount_hits:
+        spans.append((h.start, h.end, "amount", h))
+    for d in date_hits:
+        spans.append((d.start, d.end, "date", d))
+    spans.sort(key=lambda s: s[0])
+
+    items: List[Item] = []
+    cursor = 0
+    for start, end, kind, payload in spans:
+        gap = text[cursor:start]
+        if gap.strip():
+            items.append(Item("text", line_no, gap.strip(), origin_line=line_no))
+        if kind == "amount":
+            items.append(Item("amount", line_no, payload.raw,
+                              amount=payload.value, origin_line=line_no))
+        else:
+            items.append(Item("date", line_no, payload.raw,
+                              date=payload, origin_line=line_no))
+        cursor = end
+
+    tail = text[cursor:]
+    if tail.strip():
+        items.append(Item("text", line_no, tail.strip(), origin_line=line_no))
+
+    return items
+
+
+# ==================== 余额列处理 ====================
+
+def _balance_pairs_match(pairs: List[Tuple[float, float]]) -> bool:
+    """判断一组 (交易金额, 疑似余额) 是否符合余额列的数学特征。
+
+    余额列的可靠特征是：本条余额 = 上一条余额 ± 本条交易金额。只要多数
+    条目满足这个递推关系，就可以确定第二个数字是余额而不是交易金额。
+    这比"看表头有没有 Balance 字样"可靠得多，因为粘贴出来的数据经常
+    根本没有表头。
+    """
+    if len(pairs) < 3:
+        return False
+
+    matches = 0
+    checks = 0
+    for i in range(1, len(pairs)):
+        prev_balance = pairs[i - 1][1]
+        txn_amount, balance = pairs[i]
+        checks += 1
+        if (abs(balance - (prev_balance + txn_amount)) < 0.01
+                or abs(balance - (prev_balance - txn_amount)) < 0.01):
+            matches += 1
+
+    return checks > 0 and (matches / checks) >= 0.6
+
+
+def detect_balance_column(line_items: List[List[Item]]) -> bool:
+    """自动判断【跨行】数据的行尾是否为余额列。"""
+    pairs = []
+    for items in line_items:
+        amounts = [i.amount for i in items if i.kind == "amount"]
+        if len(amounts) >= 2:
+            pairs.append((amounts[-2], amounts[-1]))
+    return _balance_pairs_match(pairs)
+
+
+def demote_extra_dates_to_text(items: List[Item]) -> List[Item]:
+    """把一行里"多余的日期"降级成普通文字。
+
+    一行里的交易笔数由金额个数决定。如果日期个数比金额个数还多，多出来的
+    日期几乎都是描述文本的一部分，而不是另一笔交易的日期，例如：
+
+        04/22 PAYMENT FOR INVOICE DATED 03/15 125.00
+
+    这里只有一笔交易（一个金额），03/15 属于摘要内容。如果不做这一步，
+    第二个日期会触发"日期槽已占用"的收尾规则，把这一行硬拆成两条残缺
+    记录，两条都进不了结果。
+
+    处理方式是保留最靠前的那个日期作为交易日期，其余日期原样转成文字
+    留在商户描述里，信息不会丢失。
+
+    这个规则刻意只在【这一行恰好只有一个金额】时才生效，也就是确定这行
+    只有一笔交易的时候。一旦出现多个金额，就说明这是多笔交易挤在一行
+    （见 split_compact_line_items），此时哪个日期属于哪一笔本身就是有
+    歧义的，硬猜反而容易把正确的交易日期改错，不如交给切分逻辑处理，
+    实在拿不准的会进入"待确认"由人工判断。
+
+    跨行拆开的数据（每行只有日期或只有金额）也完全不受影响。
+    """
+    date_positions = [i for i, it in enumerate(items) if it.kind == "date"]
+    amount_count = sum(1 for it in items if it.kind == "amount")
+
+    if amount_count != 1 or len(date_positions) <= 1:
+        return items
+
+    keep = set(date_positions[:1])
+    for index in date_positions:
+        if index in keep:
+            continue
+        old_item = items[index]
+        items[index] = Item(
+            "text", old_item.line_no, old_item.raw,
+            origin_line=old_item.origin_line,
+        )
+    return items
+
+
+def split_compact_line_items(items: List[Item], balance_mode: str = "auto"
+                             ) -> Tuple[List[List[Item]], bool]:
+    """把"好几笔交易挤在同一行"的数据切成一笔一段。
+
+    原始数据本该一行一笔，但复制粘贴时经常变成一整条长串：
+
+        11/22/2025 AMAZON 9.99 11/23/2025 WALMART 19.99 11/24/2025 SHELL 29.99
+
+    这里先判断这一行是不是这种"连行"数据，是的话就切开，让后面的组装
+    逻辑可以像处理正常多行数据一样处理它们。
+
+    判定条件刻意收得比较紧：必须同时出现至少 2 个日期，且金额个数等于
+    日期个数（每笔一个金额）或等于日期个数的两倍（每笔还跟一个余额）。
+    只有 1 个日期的普通行、或者日期和金额个数对不上的行，一律原样返回，
+    避免把正常单笔交易误切开。
+
+    返回 (切分后的段落列表, 是否识别出并剔除了行内余额)。
+    """
+    date_positions = [i for i, it in enumerate(items) if it.kind == "date"]
+    amount_positions = [i for i, it in enumerate(items) if it.kind == "amount"]
+
+    if len(date_positions) < 2:
+        return [items], False
+    if len(amount_positions) not in (len(date_positions), 2 * len(date_positions)):
+        return [items], False
+
+    balance_detected = False
+
+    # 每笔交易配了两个金额时，第二个通常是余额。用同样的递推关系确认，
+    # 确认成立才剔除；否则宁可保留，让它进入"待确认"提示人工判断。
+    if len(amount_positions) == 2 * len(date_positions):
+        pairs = [
+            (items[amount_positions[i]].amount, items[amount_positions[i + 1]].amount)
+            for i in range(0, len(amount_positions), 2)
+        ]
+        should_drop = (
+            balance_mode == "last_is_balance"
+            or (balance_mode == "auto" and _balance_pairs_match(pairs))
+        )
+        if should_drop:
+            drop_positions = set(amount_positions[1::2])
+            items = [it for i, it in enumerate(items) if i not in drop_positions]
+            balance_detected = True
+            date_positions = [i for i, it in enumerate(items) if it.kind == "date"]
+
+    # 判断这一行的版式：日期在商户前面，还是商户在日期前面。
+    # 两种版式的切分点不同，必须先认出来：
+    #   日期在前 -> 每遇到一个新日期就是新的一笔
+    #   商户在前 -> 当前这笔已经凑齐日期和金额后，再遇到文字就是下一笔的商户
+    first_date = date_positions[0] if date_positions else None
+    first_text = next((i for i, it in enumerate(items) if it.kind == "text"), None)
+    date_leads = (first_text is None) or (first_date is not None and first_date < first_text)
+
+    segments: List[List[Item]] = []
+    current: List[Item] = []
+    has_date = False
+    has_amount = False
+
+    for item in items:
+        start_new = False
+        if item.kind == "date" and has_date:
+            start_new = True
+        elif item.kind == "amount" and has_amount:
+            start_new = True
+        elif item.kind == "text" and (not date_leads) and has_date and has_amount:
+            start_new = True
+
+        if start_new and current:
+            segments.append(current)
+            current = []
+            has_date = False
+            has_amount = False
+
+        current.append(item)
+        if item.kind == "date":
+            has_date = True
+        elif item.kind == "amount":
+            has_amount = True
+
+    if current:
+        segments.append(current)
+
+    return segments, balance_detected
+
+
+def apply_balance_column(line_items: List[List[Item]], mode: str) -> Tuple[List[List[Item]], bool]:
+    """按设置去掉每行末尾的余额金额。"""
+    detected = False
+    if mode == "auto":
+        detected = detect_balance_column(line_items)
+        drop = detected
+    elif mode == "last_is_balance":
+        drop = True
+    else:
+        drop = False
+
+    if not drop:
+        return line_items, detected
+
+    cleaned: List[List[Item]] = []
+    for items in line_items:
+        amount_indexes = [idx for idx, i in enumerate(items) if i.kind == "amount"]
+        if len(amount_indexes) >= 2:
+            last = amount_indexes[-1]
+            cleaned.append([i for idx, i in enumerate(items) if idx != last])
+        else:
+            cleaned.append(items)
+    return cleaned, (detected or mode == "last_is_balance")
+
+
+# ==================== 记录组装 ====================
+
+def assemble_records(all_items: List[Item], options: ProcessOptions
+                     ) -> Tuple[List[Record], List[Record]]:
+    """把散落的单元组装成一条条完整记录。
+
+    组装规则（与日期/商户/金额的先后顺序无关）：
+
+      * 日期单元 -> 填入当前记录的日期槽；若日期槽已被占用，说明上一条
+        记录结束了，先收尾再开新记录。
+      * 金额单元 -> 同理填入金额槽。
+      * 文字单元 -> 追加到商户名。
+
+    另外有两条防串行的保护规则：
+
+      1. 一条记录一旦已经拿到金额，就只接受【同一行】的后续单元。
+         新的一行必定属于新记录。这可以防止某行残留的孤立金额
+         （例如小计行）跟下一行的日期粘成一条假交易。
+      2. 一条记录最多跨 max_record_span 行，超过就强制收尾。
+    """
+    completed: List[Record] = []
+    unresolved: List[Record] = []
+    current = Record()
+
+    def flush():
+        nonlocal current
+        if not current.is_empty():
+            if current.is_complete():
+                completed.append(current)
+            else:
+                unresolved.append(current)
+        current = Record()
+
+    for item in all_items:
+        same_line = (current.last_group_key == item.line_no)
+
+        # 保护规则 1：已经有金额的记录，不再接受新行（新段落）的内容。
+        if (not current.is_empty()) and current.amount is not None and not same_line:
+            flush()
+            same_line = False
+
+        # 保护规则 2：跨行数超限就收尾。
+        if (current.group_keys
+                and (item.line_no - min(current.group_keys)) >= options.max_record_span):
+            flush()
+            same_line = False
+
+        if item.kind == "date":
+            if current.date is not None:
+                flush()
+            current.date = item.date
+
+        elif item.kind == "amount":
+            if current.amount is not None:
+                flush()
+            current.amount = item.amount
+
+        else:  # text
+            if current.is_empty():
+                current.merchant_parts.append(item.raw)
+            elif not current.merchant_raw.strip():
+                # 记录还没有商户名，这段文字就是它的描述（可能在下一行）。
+                current.merchant_parts.append(item.raw)
+            elif same_line:
+                # 同一行内的补充说明，直接接在商户名后面。
+                current.merchant_parts.append(item.raw)
+            else:
+                # 记录已经有商户名了，新一行的文字视为新记录的开头。
+                flush()
+                current.merchant_parts.append(item.raw)
+
+        current.line_nos.append(item.origin_line or item.line_no)
+        current.group_keys.append(item.line_no)
+        current.last_group_key = item.line_no
+
+    flush()
+    return completed, unresolved
+
+
+# ==================== 输出格式化 ====================
+
+def format_date(date_hit: DateHit, options: ProcessOptions) -> str:
+    """按设置输出日期。
+
+    默认 MM/DD 且零填充，因为 BSDP 主程序的默认日期规则要求两位月份和
+    两位日期（04/22 可以，4/22 不行）。这样整理完的数据不需要在主程序里
+    额外设置日期格式就能直接使用。
+    """
+    style = (options.date_output_format or "MM/DD").upper()
+
+    if style == "KEEP":
+        return date_hit.raw
+
+    year = date_hit.year
+    if year is None:
+        default_year = str(options.default_year or "").strip()
+        if default_year.isdigit():
+            year = _normalize_two_digit_year(default_year)
+
+    if style == "MM/DD/YYYY" and year:
+        return f"{date_hit.month:02d}/{date_hit.day:02d}/{year:04d}"
+    if style == "MM/DD/YY" and year:
+        return f"{date_hit.month:02d}/{date_hit.day:02d}/{year % 100:02d}"
+
+    # 没有年份可用时统一退回 MM/DD，主程序同样支持。
+    return f"{date_hit.month:02d}/{date_hit.day:02d}"
+
+
+def format_amount(value: float, options: ProcessOptions) -> str:
+    """输出金额。结果保证能被主程序的金额规则识别。"""
+    mode = (options.amount_sign_mode or "keep").lower()
+    if mode == "abs":
+        value = abs(value)
+    elif mode == "negative":
+        value = -abs(value)
+    return f"{value:.2f}"
+
+
+def build_output_text(transactions: List[Transaction], options: ProcessOptions) -> str:
+    """生成可直接粘贴回 BSDP 主程序的文本。
+
+    two_line（默认，兼容性最好）：
+        04/22 AMAZON.COM
+        125.00
+
+    one_line：
+        04/22 AMAZON.COM 125.00
+    """
+    lines: List[str] = []
+    for txn in transactions:
+        date_text = format_date(txn.date, options)
+        amount_text = format_amount(txn.amount, options)
+        if options.output_style == "one_line":
+            lines.append(f"{date_text} {txn.merchant} {amount_text}")
+        else:
+            lines.append(f"{date_text} {txn.merchant}")
+            lines.append(amount_text)
+    return "\n".join(lines)
+
+
+# ==================== 主处理入口 ====================
+
+def process_text(raw_text: str, options: Optional[ProcessOptions] = None) -> ProcessResult:
+    """把杂乱的原始账单文本整理成标准格式。"""
+    options = options or ProcessOptions()
+    result = ProcessResult()
+
+    text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    raw_lines = text.split("\n")
+
+    line_items: List[List[Item]] = []
+    group_key = 0
+    inline_balance_detected = False
+    for index, line in enumerate(raw_lines, start=1):
+        if not line.strip():
+            continue
+        if looks_like_skippable_line(
+                line, options.skip_keywords,
+                day_first_mode=options.day_first_mode,
+                allow_dot_separator=options.allow_dot_separator,
+                allow_compact_mmdd=options.allow_compact_mmdd):
+            result.skipped_lines.append((index, line.strip()))
+            continue
+        items = tokenize_line(line, index, options)
+        if not items:
+            continue
+
+        # 先把"比金额还多出来的日期"还原成描述文字，避免摘要里的日期被
+        # 误当成另一笔交易的开始。
+        items = demote_extra_dates_to_text(items)
+
+        # 一行里挤了多笔交易时，先切成一笔一段。切开后每段拿到独立的分组键，
+        # 于是后续组装逻辑对待它们的方式和对待正常的一行一笔完全一致。
+        segments, inline_balance = split_compact_line_items(
+            items, options.balance_column_mode
+        )
+        if inline_balance:
+            inline_balance_detected = True
+
+        for segment in segments:
+            group_key += 1
+            for item in segment:
+                item.line_no = group_key
+            line_items.append(segment)
+
+    line_items, balance_detected = apply_balance_column(
+        line_items, options.balance_column_mode
+    )
+    result.balance_column_detected = balance_detected or inline_balance_detected
+
+    all_items: List[Item] = [i for items in line_items for i in items]
+    completed, unresolved = assemble_records(all_items, options)
+
+    for record in completed:
+        merchant = clean_merchant_text(
+            record.merchant_raw,
+            remove_noise=options.remove_noise,
+            remove_items=options.remove_items,
+        )
+        if not merchant:
+            # 清洗之后商户名空了（整行都是噪音），交给人工确认，
+            # 不要生成一条没有商户名的记录 —— 主程序也无法识别。
+            result.issues.append(Issue(
+                sorted(set(record.line_nos)),
+                "清理后商户名为空",
+                record.merchant_raw or "(无文字内容)",
+            ))
+            continue
+        result.transactions.append(Transaction(
+            date=record.date,
+            merchant=merchant,
+            amount=record.amount,
+            source_lines=sorted(set(record.line_nos)),
+        ))
+
+    for record in unresolved:
+        missing = []
+        if record.date is None:
+            missing.append("日期")
+        if record.amount is None:
+            missing.append("金额")
+        if not record.merchant_raw.strip():
+            missing.append("商户")
+        content_parts = []
+        if record.date is not None:
+            content_parts.append(record.date.raw)
+        if record.merchant_raw.strip():
+            content_parts.append(record.merchant_raw.strip())
+        if record.amount is not None:
+            content_parts.append(f"{record.amount:.2f}")
+        result.issues.append(Issue(
+            sorted(set(record.line_nos)),
+            "缺少" + "、".join(missing),
+            " | ".join(content_parts) or "(空)",
+        ))
+
+    # 智能提示：帮用户判断该调整哪个选项。
+    #
+    # 余额列的自动检测依赖"本行余额 = 上一行余额 ± 本行金额"这个连续关系，
+    # 因此当账单里只有部分行带余额（中间夹着没有余额的行）时，连续性被打断，
+    # 自动检测会保守地判定"没有余额列"。这时那些余额数字会变成一堆
+    # 只有金额、没有日期也没有商户的待确认记录 —— 这个特征非常明显，
+    # 据此主动提醒用户把选项改成"最后一个是余额"，比让用户自己猜要好。
+    lonely_amounts = sum(
+        1 for issue in result.issues
+        if "日期" in issue.reason and "商户" in issue.reason
+    )
+    if lonely_amounts >= 2 and options.balance_column_mode != "last_is_balance":
+        result.hints.append(
+            f"检测到 {lonely_amounts} 条只有金额、没有日期和商户的内容，"
+            "这通常是行尾的余额列，未被写入。"
+        )
+
+    if result.balance_column_detected:
+        result.hints.append("已自动识别并排除行尾的余额列。")
+
+    unresolved_dates = sum(1 for issue in result.issues if "缺少日期" in issue.reason)
+    if unresolved_dates >= 2 and not options.allow_compact_mmdd:
+        result.hints.append(
+            "有多条内容缺少可识别的日期，未被写入。"
+        )
+
+    result.output_text = build_output_text(result.transactions, options)
+    result.total_amount = sum(
+        (abs(t.amount) if options.amount_sign_mode == "abs" else t.amount)
+        for t in result.transactions
+    )
+    return result
+
+
+def build_preprocessor_options(
+        date_format_input: str = "",
+        balance_column_mode: str = "auto",
+        allow_compact_mmdd: bool = False,
+) -> ProcessOptions:
+    """根据主界面上的设置，构造预处理参数。
+
+    这里顺带做了一个自动推断：如果用户在"日期示例"里填的是用点号分隔的
+    写法（例如 4.22），就自动打开预处理的"点号也算日期分隔符"，省得用户
+    在两个地方各设置一次。
+    """
+    sample = str(date_format_input or "")
+    uses_dot = "." in sample and not re.search(r"\d\.\d{2}(?!\d)", sample)
+
+    return ProcessOptions(
+        allow_dot_separator=uses_dot,
+        allow_compact_mmdd=bool(allow_compact_mmdd),
+        balance_column_mode=balance_column_mode,
+        # 输出零填充的 MM/DD，正好是本程序默认日期规则能识别的格式。
+        date_output_format="MM/DD",
+        output_style="two_line",
+    )
+
+
+def run_statement_preprocessor(raw_text: str, options: Optional[ProcessOptions] = None):
+    """整理原始账单文本，返回 (整理后的文本, 结果对象)。"""
+    result = process_text(raw_text, options or ProcessOptions())
+    return result.output_text, result
 
 
 def excel_col_letter(col_num: int) -> str:
@@ -1324,28 +2404,72 @@ DIRECT_LOCAL_REF_RE = re.compile(
 )
 
 
-def retarget_cross_sheet_row_references(wb, sheet_name: str, old_row: int, new_row: int) -> int:
-    """Repair formulas elsewhere in the workbook that reference a specific row
-    on ``sheet_name`` after that row has moved (e.g. its Total row, after
-    merging duplicate merchants deleted rows above it, or after inserting a
-    new merchant row pushed it down).
+def shift_local_row_references(ws, from_row: int, offset: int,
+                               min_row: Optional[int] = None) -> int:
+    """按 Excel 的插入/删除语义，平移同一工作表内公式里的行号。
 
-    openpyxl edits the workbook structurally (row insert/delete) but has no
-    formula engine, so it never rewrites cross-sheet formula references that
-    live on OTHER sheets -- only same-sheet formulas get any special handling,
-    and even that only for a few operations. A Credit sheet's DEBIT column
-    (or any other imported cross-sheet reference such as
-    ='Some Debit Sheet'!G14) is exactly this kind of reference: once the
-    referenced Debit sheet's Total row moves, that formula keeps pointing at
-    the old row and silently reads stale/wrong data or a leftover empty cell.
+    Excel 在第 P 行插入 N 行时，工作簿中所有指向第 P 行及以下的引用都会
+    自动 +N；删除行时同理 -N。openpyxl 只会把单元格搬走，完全不改公式
+    文字，所以这件事必须由我们自己做。
 
-    This scans every worksheet for a formula containing a reference to
-    ``sheet_name`` at ``old_row`` (any column, with or without $ anchors,
-    quoted or bare sheet name) and rewrites just the row number to
-    ``new_row``, leaving the column letter, $ anchors, and the rest of the
-    formula untouched. Returns the number of formula cells updated.
+    Debit 模板常见的 Total 下方汇总块（BEGIN / ADD / LESS / END）就依赖
+    这个行为，它里面有两类引用，缺一不可：
+
+      * 指向 Total 行本身，例如 ADD 行的 ``=B22``；
+      * 块内互相引用，例如 END 行的 ``=B24+B25-B26``（分别指向 BEGIN /
+        ADD / LESS 三行）。
+
+    只修第一类是不够的：新增商户会把整个汇总块往下推，块内互相引用如果
+    不跟着平移，就会掉头指向上面的商户行，算出一个看起来正常、其实完全
+    错误的数字。按行号统一平移可以一次覆盖这两类。
+
+    ``from_row``  从这一行开始（含）的引用需要平移，也就是插入/删除发生
+                  的位置；它上面的行没有移动，引用必须原样保留。
+    ``offset``    平移量，插入为正、删除为负。
+    ``min_row``   限制只重写这一行及以下的公式，调用方必须传。数据区里
+                  的商户 Total 公式和 Total 行自己的 SUM 都是程序刚刚
+                  按当前行号重新写好的，绝不能再被平移一次。
     """
-    if old_row == new_row or old_row is None or new_row is None:
+    if not offset or from_row is None:
+        return 0
+
+    start_row = max(1, int(min_row)) if min_row else 1
+    if start_row > ws.max_row:
+        return 0
+
+    # (?<!!) 排除紧跟在 "!" 后面的部分，那是跨表引用（='Sheet'!B14）的尾巴，
+    # 由 shift_cross_sheet_row_references 单独处理。
+    ref_re = re.compile(r"(?<!!)(\$?[A-Z]{1,3}\$?)(\d+)\b")
+
+    def repl(match):
+        column, row_text = match.group(1), match.group(2)
+        row_number = int(row_text)
+        if row_number < from_row:
+            return match.group(0)
+        return f"{column}{row_number + offset}"
+
+    updated = 0
+    for row_cells in ws.iter_rows(min_row=start_row):
+        for cell in row_cells:
+            value = cell.value
+            if not isinstance(value, str) or not value.lstrip().startswith("="):
+                continue
+            new_value = ref_re.sub(repl, value)
+            if new_value != value:
+                cell.value = new_value
+                updated += 1
+    return updated
+
+
+def shift_cross_sheet_row_references(wb, sheet_name: str, from_row: int, offset: int) -> int:
+    """同样的行号平移，但作用于【其他工作表】指向本表的跨表引用。
+
+    例如 Credit 表的 DEBIT 列写着 ='CHASE #8565'!G22 指向 Debit 表的 Total
+    行。Debit 表插入新商户后 Total 下移，这个引用必须跟着走，否则会一直
+    读到一个已经不是 Total 的旧行。除 Total 外，模板也可能引用汇总块里的
+    END 行等，所以这里同样按行号统一平移，而不是只认某一个行号。
+    """
+    if not offset or from_row is None:
         return 0
 
     escaped_name = re.escape(sheet_name.replace("'", "''"))
@@ -1355,9 +2479,14 @@ def retarget_cross_sheet_row_references(wb, sheet_name: str, old_row: int, new_r
     else:
         sheet_pattern = rf"(?:'{escaped_name}'|{re.escape(sheet_name)})"
 
-    ref_re = re.compile(
-        rf"({sheet_pattern}!\s*\$?[A-Z]{{1,3}}\$?){old_row}\b"
-    )
+    ref_re = re.compile(rf"({sheet_pattern}!\s*\$?[A-Z]{{1,3}}\$?)(\d+)\b")
+
+    def repl(match):
+        prefix, row_text = match.group(1), match.group(2)
+        row_number = int(row_text)
+        if row_number < from_row:
+            return match.group(0)
+        return f"{prefix}{row_number + offset}"
 
     updated = 0
     for other_ws in wb.worksheets:
@@ -1366,52 +2495,10 @@ def retarget_cross_sheet_row_references(wb, sheet_name: str, old_row: int, new_r
                 value = cell.value
                 if not isinstance(value, str) or not value.lstrip().startswith("="):
                     continue
-                new_value, count = ref_re.subn(rf"\g<1>{new_row}", value)
-                if count:
+                new_value = ref_re.sub(repl, value)
+                if new_value != value:
                     cell.value = new_value
                     updated += 1
-    return updated
-
-
-def retarget_local_row_references(ws, old_row: int, new_row: int) -> int:
-    """Repair SAME-SHEET formulas that reference a specific row after that row
-    moved (e.g. a Debit sheet's Total row, after merging duplicate merchants
-    deleted rows above it, or after inserting a new merchant row pushed it
-    down).
-
-    Some Debit templates have extra summary rows below Total -- typically
-    labeled BEGIN / ADD / LESS / END (case-insensitive, e.g. "Add" or "ADD")
-    -- whose formulas pull directly from the Total row's own cells, e.g. a
-    plain ``=B14`` sitting in the "ADD" row. Deleting duplicate merchant rows,
-    or inserting a brand-new merchant row, moves Total up or down, but
-    openpyxl does not rewrite this kind of plain local formula reference on
-    its own, so it silently keeps reading the row that used to be Total (now
-    something else, or blank). This finds every formula cell containing a
-    bare column+old_row reference -- never a cross-sheet reference such as
-    ='Sheet'!B14, which is handled separately by
-    retarget_cross_sheet_row_references -- and rewrites just the row number,
-    keeping the column letter and any $ anchors intact. Row labels ("ADD",
-    "BEGIN", etc.) are never inspected, only the actual cell formulas, so this
-    works no matter what a template calls that row or how it is capitalized.
-    """
-    if old_row == new_row or old_row is None or new_row is None:
-        return 0
-
-    # (?<!!) excludes a reference immediately preceded by "!" -- that would be
-    # the tail end of a cross-sheet reference like ='Sheet'!B14, which must be
-    # left for retarget_cross_sheet_row_references to handle instead.
-    ref_re = re.compile(rf"(?<!!)(\$?[A-Z]{{1,3}}\$?){old_row}\b")
-
-    updated = 0
-    for row_cells in ws.iter_rows():
-        for cell in row_cells:
-            value = cell.value
-            if not isinstance(value, str) or not value.lstrip().startswith("="):
-                continue
-            new_value, count = ref_re.subn(rf"\g<1>{new_row}", value)
-            if count:
-                cell.value = new_value
-                updated += 1
     return updated
 
 
@@ -2838,7 +3925,10 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
     # sheet's DEBIT column imported from an existing report) that still
     # references the old Total row position.
     if old_total_row is not None and old_total_row != total_row:
-        retarget_cross_sheet_row_references(ws.parent, ws.title, old_total_row, total_row)
+        # 新增商户是在旧 Total 行的位置插入的，因此"旧 Total 行及其下方"的
+        # 所有内容整体下移了 offset 行，指向它们的公式必须同步平移。
+        offset = total_row - old_total_row
+        shift_cross_sheet_row_references(ws.parent, ws.title, old_total_row, offset)
         # Some Debit templates also have a summary row directly below Total
         # -- commonly labeled "Add" / "ADD" (or Begin/Less/End) -- whose
         # formula reads Total's own cells directly (e.g. a plain "=B14").
@@ -2846,7 +3936,13 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
         # from the cross-sheet fix above; otherwise it keeps pointing at the
         # row Total used to occupy before this new merchant row pushed it
         # down, and silently shows stale or blank numbers.
-        retarget_local_row_references(ws, old_total_row, total_row)
+        #
+        # min_row 必不可少：只能重写 Total 行【下方】的汇总块。上方的商户行
+        # 和 Total 行自己的公式，程序刚刚按当前行号重新写好，再平移一次就
+        # 全错了。
+        shift_local_row_references(
+            ws, old_total_row, offset, min_row=total_row + 1
+        )
 
 
 def append_rows_to_selected_sheet(
@@ -3069,12 +4165,15 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
         # this sheet's OLD Total row must be repointed at the new one, or it
         # will keep reading a stale/empty row after the merge.
         if summary_row is not None and new_summary_row is not None:
-            retarget_cross_sheet_row_references(wb, sheet_name, summary_row, new_summary_row)
+            merge_offset = new_summary_row - summary_row
+            shift_cross_sheet_row_references(wb, sheet_name, summary_row, merge_offset)
             # Some templates also have extra summary rows below Total (BEGIN /
             # ADD / LESS / END) whose formulas pull directly from Total's own
             # cells (e.g. a plain =B14 in the "ADD" row). Those same-sheet
             # references need the same repair.
-            retarget_local_row_references(ws, summary_row, new_summary_row)
+            shift_local_row_references(
+                ws, summary_row, merge_offset, min_row=new_summary_row + 1
+            )
 
         wb.save(xlsx_path)
         return {
@@ -3139,6 +4238,12 @@ def run_parser_ui():
     month_var = tk.StringVar(value="")
     bank_name_var = tk.StringVar(value=DEFAULT_BANK_NAME)
     sheet_var = tk.StringVar(value="")
+    # 下面三个变量对应的输入控件已从界面移除，但变量本身保留：写入流程仍会
+    # 照常读取它们，只是现在恒为默认值 —— Bank Name 为空（即不往 Credit 表
+    # 第一行写银行名）、余额列走自动判断、无分隔符日期识别关闭。这样处理
+    # 逻辑一行都不用改，将来想把某个选项放回界面也只需重新加控件。
+    balance_mode_var = tk.StringVar(value="自动判断")
+    compact_date_var = tk.BooleanVar(value=False)
     status_history: List[str] = []
 
     sheet_names: List[str] = []
@@ -3188,15 +4293,6 @@ def run_parser_ui():
         "4-22 → M-DD    May 17 → M DD    17 May → DD M    2025-4-22 → YYYY-M-DD",
         fg="#9cdcfe", justify="left", anchor="w"
     ).grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 7))
-
-    mk_label(filebar, "Bank Name（仅 Credit 表第一行使用）：").grid(
-        row=5, column=0, sticky="w", pady=3
-    )
-    ent_bank = tk.Entry(
-        filebar, textvariable=bank_name_var, bg="#111", fg=FG,
-        insertbackground=FG, relief="flat"
-    )
-    ent_bank.grid(row=5, column=1, padx=(8, 8), sticky="we", pady=3)
 
     # ---------- 文本框及工作表/日期选择 ----------
     body = tk.Frame(root, bg=BG)
@@ -3482,8 +4578,67 @@ def run_parser_ui():
                 f"自动识别: {selected_sheet_type.title()}"
             )
 
+            # 第一步：按原有方式删除用户指定的关键词。
             preprocessed_text = preprocess_statement_text(content, remove_items)
-            hits = parse_auto(preprocessed_text)
+
+            # 第二步：直接解析一次（这就是接入自动整理之前的老流程），
+            # 结果只作为对照和兜底，保证新增的自动整理永远不会让识别结果变差。
+            configure_date_format(resolved_date_format)
+            direct_hits = parse_auto(preprocessed_text)
+
+            # 第三步：自动整理后再解析一次。
+            #
+            # 注意这里必须把日期规则切回默认：整理后的文本日期已经被统一成
+            # 零填充的 MM/DD，如果继续套用用户填写的自定义日期格式
+            # （例如 M-DD），反而会因为格式对不上而解析失败。
+            balance_mode = {
+                "自动判断": "auto",
+                "没有余额列": "none",
+                "最后一个是余额": "last_is_balance",
+            }.get(balance_mode_var.get(), "auto")
+
+            pre_options = build_preprocessor_options(
+                date_format_input=custom_date_input,
+                balance_column_mode=balance_mode,
+                allow_compact_mmdd=bool(compact_date_var.get()),
+            )
+            cleaned_text, pre_result = run_statement_preprocessor(
+                preprocessed_text, pre_options
+            )
+            configure_date_format("")
+            auto_hits = parse_auto(cleaned_text)
+
+            # 第四步：取识别更多的那一套。自动整理只有在确实更好时才会被采用，
+            # 否则自动退回老流程，绝不会因为多了这一步而少写入交易。
+            if len(auto_hits) >= len(direct_hits):
+                hits = auto_hits
+                mode_note = "自动整理"
+            else:
+                hits = direct_hits
+                mode_note = "直接解析（自动整理结果更少，已自动回退）"
+                # 回退时把日期规则恢复成用户填写的设置，保持与老流程一致。
+                configure_date_format(resolved_date_format)
+
+            # 第五步：整理过程中如果有内容没能识别，先告诉用户再写入，
+            # 避免这些内容被静默丢掉。
+            if mode_note == "自动整理" and pre_result is not None and pre_result.issues:
+                preview = "\n".join(
+                    f"  第 {','.join(str(n) for n in issue.line_nos)} 行：{issue.reason} - {issue.content[:50]}"
+                    for issue in pre_result.issues[:6]
+                )
+                more = (f"\n  ...另有 {len(pre_result.issues) - 6} 条"
+                        if len(pre_result.issues) > 6 else "")
+                hint_text = ("\n\n" + "\n".join(pre_result.hints)) if pre_result.hints else ""
+                proceed = messagebox.askyesno(
+                    "有内容未能识别",
+                    f"自动整理时有 {len(pre_result.issues)} 处内容无法识别，"
+                    f"这些内容不会被写入 Excel：\n\n{preview}{more}{hint_text}\n\n"
+                    f"将写入 {len(hits)} 笔交易，是否继续？"
+                )
+                if not proceed:
+                    log_status("已取消写入（存在未识别内容）")
+                    return
+
             rows = [(h.merchant, h.amount, h.who) for h in hits]
             summary_xlsx = get_summary_output_path(summary_var.get())
 
@@ -3496,15 +4651,22 @@ def run_parser_ui():
 
             log_status(
                 f"已完成 / Completed | Excel Sheet: {selected_sheet} | 日期: {selected_month_display} | "
-                f"自动识别: {detected_type.title()} | 总表: {summary_xlsx.name}"
+                f"自动识别: {detected_type.title()} | 方式: {mode_note} | 总表: {summary_xlsx.name}"
             )
             date_format_display = (
                 resolved_date_format if resolved_date_format
                 else "默认格式 MM/DD、MM/DD/YY、MM/DD/YYYY"
             )
+            extra_note = ""
+            if pre_result is not None and mode_note == "自动整理":
+                extra_note = f"未识别内容: {len(pre_result.issues)} 处\n"
+                if pre_result.balance_column_detected:
+                    extra_note += "已自动排除行尾余额列\n"
             messagebox.showinfo(
                 "Completed",
                 f"提取成功: {len(rows)} 笔交易\n"
+                f"处理方式: {mode_note}\n"
+                f"{extra_note}"
                 f"当前Excel Sheet: {selected_sheet}\n"
                 f"当前日期: {selected_month_display}\n"
                 f"自动识别类型: {detected_type.title()}\n"
