@@ -4649,9 +4649,22 @@ def run_parser_ui():
                 bank_name=bank_name,
             )
 
+            # 写入成功后自动清空输入框，方便直接粘贴下一批账单。
+            #
+            # 位置很关键：这行必须放在 append_rows_to_selected_sheet 成功返回
+            # 之后。前面任何一步抛异常、或者用户在"有内容未能识别"的确认框里
+            # 选择了取消，都会在到达这里之前就退出，原始数据因此得以保留 ——
+            # 否则用户就得回银行网站重新复制一遍。
+            #
+            # 这里刻意不调用 edit_reset()：文本框创建时开启了 undo，保留撤销
+            # 记录意味着万一写错了 Sheet 或月份，按 Ctrl+Z 就能把刚才粘贴的
+            # 内容找回来，不至于因为自动清空而丢失。
+            txt_input.delete("1.0", tk.END)
+            txt_input.focus_set()
+
             log_status(
                 f"已完成 / Completed | Excel Sheet: {selected_sheet} | 日期: {selected_month_display} | "
-                f"自动识别: {detected_type.title()} | 方式: {mode_note} | 总表: {summary_xlsx.name}"
+                f"自动识别: {detected_type.title()} | 方式: {mode_note} | 总表: {summary_xlsx.name} | 文本框已清空"
             )
             date_format_display = (
                 resolved_date_format if resolved_date_format
@@ -4674,6 +4687,8 @@ def run_parser_ui():
                 f"日期格式: {date_format_display}\n"
                 f"总表文件: {summary_xlsx.name}\n"
                 f"分类规则文件: {category_rules_path()}\n"
+                "\n文本框已自动清空，可直接粘贴下一批账单。\n"
+                "如需找回刚才的内容，在文本框内按 Ctrl+Z 即可撤销。"
             )
         except Exception as e:
             messagebox.showerror("异常 / Error", f"{type(e).__name__}: {e}")
