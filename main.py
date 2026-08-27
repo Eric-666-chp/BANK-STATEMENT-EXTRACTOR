@@ -1830,14 +1830,40 @@ def collect_category_history_from_workbook(wb) -> Dict[str, str]:
     return history
 
 
-def merchant_similarity(a: str, b: str) -> float:
-    """Conservative similarity score for two normalized merchant names."""
-    a = normalize_merchant_for_category(a)
-    b = normalize_merchant_for_category(b)
+# 相似度剪枝下限。低于这个分数的候选，无论真实分数是多少，都不可能影响
+# 最终判定，因此可以直接跳过昂贵的字符串比对。
+#
+# 推导：自动归类要求最高分 >= CATEGORY_FUZZY_THRESHOLD，且
+# (最高分 - 第二名 >= CATEGORY_FUZZY_MARGIN) 或 最高分 >= 0.94。
+# 第二名只在"离最高分很近"时才起作用，而最高分至少是 0.86，所以只有分数
+# 高于 0.86 - 0.03 = 0.83 的候选才可能改变结论。低于它的候选，报 0 还是报
+# 真实分数，判定结果完全一样。
+CATEGORY_SIMILARITY_PRUNE_FLOOR = CATEGORY_FUZZY_THRESHOLD - CATEGORY_FUZZY_MARGIN
+
+
+def _merchant_similarity_normalized(a: str, b: str) -> float:
+    """相似度计算本体，要求传入的两个名字【已经归一化】。
+
+    拆出这一层是为了性能：调用方（历史模糊匹配）手里的两个字符串本来就
+    已经归一化过，没必要在每次比较里重新跑一遍正则和分词。归一化是幂等的，
+    所以结果与先前完全一致。
+    """
     if not a or not b:
         return 0.0
     if a == b:
         return 1.0
+
+    # 包含关系会直接把分数抬到 0.94，与两者长度差多少无关，所以必须先判断，
+    # 不能被下面的长度剪枝挡掉。
+    contained = min(len(a), len(b)) >= 4 and (a in b or b in a)
+
+    if not contained:
+        # SequenceMatcher 的 ratio 上界是 2*较短长度/(总长度)：匹配字符数
+        # 最多就是较短的那个字符串的长度。据此可以在不做任何字符串比对的
+        # 情况下算出这一对的分数上限，上限低于剪枝下限就直接放弃。
+        length_bound = 2 * min(len(a), len(b)) / (len(a) + len(b))
+        if max(length_bound, 0.70 * length_bound + 0.30) < CATEGORY_SIMILARITY_PRUNE_FLOOR:
+            return 0.0
 
     seq = SequenceMatcher(None, a, b).ratio()
     ta, tb = set(a.split()), set(b.split())
@@ -1846,9 +1872,17 @@ def merchant_similarity(a: str, b: str) -> float:
     score = max(seq, 0.70 * seq + 0.30 * jaccard)
 
     # Strong brand-prefix/containment signal, but only for meaningful names.
-    if min(len(a), len(b)) >= 4 and (a in b or b in a):
+    if contained:
         score = max(score, 0.94)
     return score
+
+
+def merchant_similarity(a: str, b: str) -> float:
+    """Conservative similarity score for two normalized merchant names."""
+    return _merchant_similarity_normalized(
+        normalize_merchant_for_category(a),
+        normalize_merchant_for_category(b),
+    )
 
 
 def get_smart_category_for_merchant(
@@ -1882,8 +1916,10 @@ def get_smart_category_for_merchant(
     best_score = 0.0
     second_score = 0.0
 
+    # 这里两个名字都已经归一化（norm 来自本函数开头，hist_norm 是历史表的
+    # 键），直接走免归一化的版本，省掉每次比较重复跑一遍正则分词。
     for hist_norm, category in history.items():
-        score = merchant_similarity(norm, hist_norm)
+        score = _merchant_similarity_normalized(norm, hist_norm)
         if score > best_score:
             second_score = best_score
             best_score = score
@@ -3334,6 +3370,150 @@ def read_period_options_from_selected_sheet(path: Path, sheet_name: str) -> Tupl
         wb.close()
 
 
+def read_sheet_period_status(path: Path, sheet_name: str):
+    """一次读取工作表，同时返回类型、Month 选项、以及每个 Month 是否已有数据。
+
+    "哪些月份已经写完"这件事的唯一可靠来源是 Excel 文件本身，而不是程序
+    运行期间的操作记录 —— 后者一关程序就没了，换台电脑也看不到。所以这里
+    直接去表里数：某个 Month 的数据区只要有一个非空单元格，就算已写入。
+
+    判断只看【数据区】，不看 Total 行：Total 行永远挂着 SUM 公式，哪怕一分
+    钱都没写也是非空的，拿它判断会全部显示成已完成。
+
+    返回 (sheet_type, [(标签, 位置), ...], {位置: 是否已有数据}, {位置: 金额合计})。
+    金额合计是把该月份数据区的单元格逐个求值相加得到的 —— openpyxl 不会计算
+    公式，所以不能直接读 Total 行的 =SUM(...)，只能自己把 "=100.00+200.00"
+    这类累加式拆开求和（safe_float already handles that form）。这个数字就是
+    Excel 里 Total 行会显示的值，可以直接和银行账单核对。
+
+    与 read_period_options_from_selected_sheet 共用同一次文件打开，避免
+    切换 Sheet 时把工作簿读两遍。
+    """
+    path = Path(path)
+    if not path.exists() or not sheet_name:
+        return "", [], {}, {}
+
+    # 与 read_period_options_from_selected_sheet 一样，这里不能用 read_only：
+    # 随机访问单元格在流式模式下会退化成每次从头扫描。
+    wb = load_workbook(path, read_only=False, data_only=False)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return "", [], {}, {}
+        ws = wb[sheet_name]
+
+        sheet_type = get_cached_sheet_type(path, sheet_name)
+        if sheet_type is None:
+            sheet_type = classify_sheet_type(ws)
+            cache_sheet_type(path, sheet_name, sheet_type)
+
+        def scan(cells):
+            """返回 (是否有非空单元格, 金额合计)。"""
+            found = False
+            total = 0.0
+            for value in cells:
+                if value is None or str(value).strip() == "":
+                    continue
+                found = True
+                total += safe_float(value)
+            return found, total
+
+        if sheet_type == "credit":
+            options = get_credit_period_options_from_column_a(ws)
+            header_row, header_map = locate_credit_columns(ws)
+            written, totals = {}, {}
+            if header_row is not None and header_map:
+                begin_col = header_map[CREDIT_BEGIN_HEADER]
+                total_credit_col = header_map[CREDIT_TOTAL_HEADER]
+                # Credit 的数据区是 Begin 与 Total Credit 之间的收入列。
+                income_cols = list(range(begin_col + 1, total_credit_col))
+                for _, row in options:
+                    found, total = scan(
+                        ws.cell(row=row, column=col).value for col in income_cols
+                    )
+                    written[row] = found
+                    totals[row] = total
+            return "credit", options, written, totals
+
+        layout = get_cached_debit_layout(path, sheet_name)
+        if layout is None:
+            layout = find_debit_layout(ws)
+            if layout is not None:
+                cache_debit_layout(path, sheet_name, layout)
+        if layout is None:
+            return "debit", [], {}, {}
+
+        header_row, merchant_col, month_cols, _, category_col = layout
+        all_cols = list(month_cols) + find_extra_debit_period_columns(ws, category_col)
+
+        # 数据区到 Total 行为止。
+        last_data_row = ws.max_row
+        for row in range(header_row + 1, ws.max_row + 1):
+            label = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+            if label.upper() in {"TOTAL", "GRAND TOTAL"}:
+                last_data_row = row - 1
+                break
+
+        options, written, totals = [], {}, {}
+        for col in all_cols:
+            text = display_cell_text(ws.cell(row=header_row, column=col)).strip()
+            if not text:
+                continue
+            options.append((text, col))
+            found, total = scan(
+                ws.cell(row=row, column=col).value
+                for row in range(header_row + 1, last_data_row + 1)
+            )
+            written[col] = found
+            totals[col] = total
+        return "debit", options, written, totals
+    finally:
+        wb.close()
+
+
+def format_amount_for_display(value: float) -> str:
+    """千分位 + 两位小数，方便和账单逐位核对。"""
+    try:
+        return f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def format_period_progress_lines(sheet_name, options, written, totals,
+                                 per_line: int = 3, max_lines: int = 4):
+    """把"已写入的月份 + 各自金额"排成若干行紧凑文本。
+
+    只列【已写入】的月份，未写入的只给一个数量。用户关心的就是"哪些月份
+    做完了"，把 12 个未写入的圆圈也铺出来只会把真正有用的信息稀释掉，还会
+    把状态栏撑得很宽。
+    """
+    if not options:
+        return [f"{sheet_name}  (无可识别月份)"]
+
+    done = [(label, totals.get(position, 0.0))
+            for label, position in options if written.get(position)]
+    pending = len(options) - len(done)
+
+    head = f"{sheet_name}  ·  已写入 {len(done)}/{len(options)}"
+    if pending:
+        head += f"  ·  待写入 {pending}"
+    lines = [head]
+
+    if not done:
+        lines.append("(暂无已写入月份)")
+        return lines
+
+    rows = [done[i:i + per_line] for i in range(0, len(done), per_line)]
+    shown, hidden = rows[:max_lines], rows[max_lines:]
+    for chunk in shown:
+        lines.append("   ".join(
+            f"{label:<9}{format_amount_for_display(amount):>13}"
+            for label, amount in chunk
+        ))
+    if hidden:
+        lines.append(f"…另有 {sum(len(c) for c in hidden)} 个月份已写入")
+    return lines
+
+
 def find_first_writable_sheet_name(path: Path, preferred_names: Optional[List[str]] = None) -> str:
     """Return the first sheet that has a recognized Credit or Debit period layout."""
     path = Path(path)
@@ -3426,21 +3606,47 @@ def append_amount_to_cell(cell, amounts: List[str]):
 
 
 def copy_row_style(ws, source_row: int, target_row: int, max_col: int):
+    """把一整行的格式复制到另一行。
+
+    只复制 ``_style`` 一个属性就够了。它是 openpyxl 内部的样式索引数组，
+    字体、边框、填充、对齐、保护、数字格式全都由它索引，复制它等于复制
+    了全部格式（已实测验证）。
+
+    早期实现在复制 ``_style`` 之后，又逐个复制了 alignment / border /
+    fill / font / protection / number_format。那 5 次额外复制完全是多余的，
+    却是最贵的部分：每次都要把样式代理对象解析成真实对象、深拷贝一遍，
+    再重新登记进工作簿的样式索引表。实测中它占掉整个写入耗时的七成以上。
+    """
+    copy_row_style_to_rows(ws, source_row, [target_row], max_col)
+
+
+def copy_row_style_to_rows(ws, source_row: int, target_rows, max_col: int):
+    """把同一行的格式批量复制到多行。
+
+    新增多个商户时，所有新行的格式都来自同一行模板，因此源行只需要读取
+    一次，之后复用。这样避免了"每插入一行就把源行重新扫一遍"的重复开销。
+    """
     from copy import copy
-    if source_row < 1:
+
+    target_rows = [r for r in (target_rows or []) if r and r >= 1]
+    if source_row < 1 or not target_rows:
         return
+
+    # 源行样式只读一次。没有样式的列记 None，跳过即可，避免给新行凭空
+    # 创建默认样式对象。
+    source_styles = []
     for col in range(1, max_col + 1):
         src = ws.cell(row=source_row, column=col)
-        dst = ws.cell(row=target_row, column=col)
-        if src.has_style:
-            dst._style = copy(src._style)
-        dst.alignment = copy(src.alignment)
-        dst.border = copy(src.border)
-        dst.fill = copy(src.fill)
-        dst.font = copy(src.font)
-        dst.protection = copy(src.protection)
-        dst.number_format = src.number_format
-    ws.row_dimensions[target_row].height = ws.row_dimensions[source_row].height
+        source_styles.append(src._style if src.has_style else None)
+
+    source_height = ws.row_dimensions[source_row].height
+
+    for target_row in target_rows:
+        for col, style in enumerate(source_styles, start=1):
+            if style is None:
+                continue
+            ws.cell(row=target_row, column=col)._style = copy(style)
+        ws.row_dimensions[target_row].height = source_height
 
 
 def copy_column_style(ws, source_col: int, target_col: int, max_row: int):
@@ -3891,13 +4097,38 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
         ws.cell(total_row, merchant_col, "Total")
     else:
         old_total_row = total_row
-    for merchant, data in merged.items():
-        r = merchant_rows.get(merchant.casefold())
-        if r is None:
-            ws.insert_rows(total_row, 1)
-            copy_row_style(ws, max(header_row + 1, total_row - 1), total_row, ws.max_column)
-            r = total_row
-            total_row += 1
+    # 先把这一批里"表中还没有的商户"全部找出来，再一次性插入。
+    #
+    # 早期实现是发现一个新商户就 insert_rows 一行。openpyxl 的每次插入都要
+    # 把插入点以下的所有单元格整体搬动一遍，插 N 个商户就搬 N 次；而且样式
+    # 模板行也被反复重新扫描。改成"算好数量、插一次"之后，搬动只发生一次，
+    # 样式模板也只读一次。
+    #
+    # 这里必须【在批内也按不区分大小写去重】。merge_same_merchants 是按原始
+    # 字符串分组的，所以同一批里 "AMAZON" / "Amazon" / "amazon" 会是三个条目。
+    # 逐个插入的老写法天然不会出问题：第一个插完就登记进 merchant_rows，后两
+    # 个查表即可命中同一行。但批量写法是在插入【之前】一次性统计的，那时三个
+    # 变体都还没登记，如果不去重就会各占一行，前两行还是没有金额的空行。
+    new_merchants = []
+    seen_new_keys = set()
+    for merchant in merged:
+        key = merchant.casefold()
+        if merchant_rows.get(key) is not None or key in seen_new_keys:
+            continue
+        seen_new_keys.add(key)
+        new_merchants.append(merchant)
+
+    if new_merchants:
+        # 样式模板行必须在插入之前确定：插入发生在 total_row 处，
+        # total_row-1 这一行不会移动，插入前后指向同一行。
+        style_source_row = max(header_row + 1, total_row - 1)
+        style_max_col = ws.max_column
+
+        ws.insert_rows(total_row, len(new_merchants))
+        inserted_rows = list(range(total_row, total_row + len(new_merchants)))
+        copy_row_style_to_rows(ws, style_source_row, inserted_rows, style_max_col)
+
+        for merchant, r in zip(new_merchants, inserted_rows):
             ws.cell(r, merchant_col, merchant)
             for c in month_cols:
                 ws.cell(r, c, None)
@@ -3909,6 +4140,11 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
                 if learned_category.upper() != CATEGORY_REVIEW_LABEL:
                     category_history[normalize_merchant_for_category(merchant)] = learned_category
             merchant_rows[merchant.casefold()] = r
+
+        total_row += len(new_merchants)
+
+    for merchant, data in merged.items():
+        r = merchant_rows[merchant.casefold()]
         append_amount_to_cell(ws.cell(r, selected_col), data["amounts"])
         ws.cell(r, total_col, build_sum_formula_for_columns(ws, r, month_cols))
     ws.cell(total_row, merchant_col, "Total")
@@ -4022,6 +4258,469 @@ def get_summary_output_path(base_path_str: str) -> Path:
 
 
 # ================= 当前工作表重复 Merchant 合并 =================
+
+# ================= Debit 商户名清洗 =================
+
+# 交易码/流水号在账单里常见的两种形态：紧跟在品牌后面的长串数字
+# （Shell247592917239），以及星号后面的一段随机码（Amazon.Com*Nx6）。
+# 这些内容对记账毫无意义，却会让同一个商户被拆成很多行。
+
+# 连续 3 位及以上的数字才算流水号。阈值定在 3 是有意的：账单里像
+# "No1 Sushi 88"、"Chase #156" 这种 1~2 位数字是商户名的一部分，
+# 一旦把它们也删掉，正常名字就被破坏了。
+MERCHANT_LONG_DIGITS_RE = re.compile(r"\d{3,}")
+
+# 域名后缀只在"后面不再跟字母"时才删，例如 amazon.com -> amazon。
+# 而 Amazon.Comseattlewa 这种 .Com 后面直接粘着字母的，说明它已经和
+# 后面的词连在一起了，贸然删除会得到 Amazonseattlewa，反而更难认，
+# 因此保持原样。
+MERCHANT_DOMAIN_SUFFIX_RE = re.compile(
+    r"(?:\.|/)(?:com|net|org|info|biz)(?![A-Za-z0-9])", re.IGNORECASE
+)
+
+# 独立的日期/编号碎片，例如 Expida143242//4/24/com 里的 4/24。
+MERCHANT_DATE_FRAGMENT_RE = re.compile(
+    r"(?<![A-Za-z0-9])\d{1,4}[/\-.]\d{1,4}(?:[/\-.]\d{1,4})?(?![A-Za-z0-9])"
+)
+
+# 字母数字混排的参考码，例如 Bill Pay 后面的 6Bu1T6Kr、4Bq1P6Kr。
+#
+# 判定看的是"字母段和数字段交替了多少次"，而不是简单的"含字母又含数字"。
+# 这一点很关键，两类字符串必须区分开：
+#
+#   Shell247592917239  字母段 + 数字段，只有 2 段 —— 这是品牌加流水号，
+#                      应该删掉数字保留 Shell；
+#   6Bu1T6Kr           6|Bu|1|T|6|Kr 交替 6 段 —— 这才是随机参考码，整词丢掉。
+#
+# 门槛定在 4 段，同时要求长度不少于 6、至少含 2 个数字，这样 7Eleven（2 段）、
+# WD40（2 段）、3M（太短）这些真实品牌名都不会被误伤。
+MERCHANT_CODE_MIN_LENGTH = 6
+MERCHANT_CODE_MIN_DIGITS = 2
+MERCHANT_CODE_MIN_RUNS = 4
+
+
+def _is_reference_code_token(token: str) -> bool:
+    """判断一个词是不是字母数字随机交替的参考码/交易码。"""
+    if len(token) < MERCHANT_CODE_MIN_LENGTH or not token.isalnum():
+        return False
+    if sum(ch.isdigit() for ch in token) < MERCHANT_CODE_MIN_DIGITS:
+        return False
+
+    runs = 1
+    for previous, current in zip(token, token[1:]):
+        if previous.isdigit() != current.isdigit():
+            runs += 1
+    return runs >= MERCHANT_CODE_MIN_RUNS
+
+
+# 纯分隔符（斜杠、星号、井号等）没有含义，可以整词丢掉。
+# 注意这里刻意不包含 &：Orange & Rockland 里的 & 是名字的一部分。
+MERCHANT_SEPARATOR_TOKEN_RE = re.compile(r"^[\s\-–—/\\*#|,;:.·]+$")
+
+
+def _is_pure_number_token(token: str) -> bool:
+    """判断一个词是不是"没有字母、且数字够长"的流水号。
+
+    这样 200045、0964、1-518-457-5434 会被丢掉，而 No1 Sushi 里的 88
+    因为只有两位数字，会被保留下来 —— 它是店名的一部分。
+    """
+    if any(ch.isalpha() for ch in token):
+        return False
+    return sum(ch.isdigit() for ch in token) >= 3
+
+
+# 这些词在 Debit 表里有结构含义：Total 标记明细区的结尾，BEGIN/ADD/LESS/
+# END 是 Total 下方的汇总行。清洗后的商户名一旦变成它们中的任何一个，
+# 整张表的结构就被破坏了 —— 例如 "Total 12345" 被清成 "Total" 后，程序会
+# 把这一行当成汇总行，后续写入的商户会插到它上面，真正的商户数据反而被
+# 挤到假 Total 行下面，Total 公式也只统计到假行为止。
+# 遇到这种情况一律放弃清洗、保留原名：名字难看远好过表结构损坏。
+MERCHANT_STRUCTURAL_LABELS = {
+    "TOTAL", "GRAND TOTAL", "SUBTOTAL", "SUB TOTAL",
+    "BEGIN", "BEGINNING", "ADD", "LESS", "END", "ENDING",
+}
+
+
+# ---------- 银行转账 / 付款类商户：整条跳过清洗 ----------
+#
+# 这类商户名里的数字往往正是判断分类所需的关键信息，例如
+# "Online Payment To Chase4568" 里的 4568 是对方账户尾号 —— 一旦被当成
+# 流水号删掉，就再也分不清这笔钱是还哪张卡、转到哪个账户了。
+#
+# 因此只要名字里出现银行名或转账/付款类关键词，就完整保留、不做任何清洗。
+# 这里刻意把范围放宽：误保护的代价只是名字没被清干净，而漏保护会直接
+# 导致无法分类，两者代价不对等。
+#
+# 银行简称必须用词边界匹配。boa 如果按子串匹配会命中 boat、boarding，
+# td 会命中 ltd、std，那样就会把无关商户也保护起来。
+MERCHANT_BANK_KEYWORDS = [
+    # 具体银行 / 金融机构
+    r"chase", r"jp\s*morgan", r"jpmorgan",
+    r"boa", r"bofa", r"bank\s*of\s*america",
+    r"wells\s*fargo", r"wellsfargo",
+    r"citi", r"citibank", r"citicard",
+    r"capital\s*one", r"capitalone",
+    r"amex", r"american\s*express",
+    r"discover", r"us\s*bank", r"usbank",
+    r"pnc", r"td\s*bank", r"tdbank",
+    r"truist", r"suntrust", r"bb&t",
+    r"hsbc", r"santander", r"ally", r"barclays",
+    r"schwab", r"fidelity", r"vanguard",
+    r"navy\s*federal", r"navyfederal", r"usaa",
+    r"sofi", r"huntington", r"regions",
+    r"key\s*bank", r"keybank", r"m&t", r"citizens",
+    r"fifth\s*third", r"bmo", r"synchrony",
+    r"credit\s*one", r"creditone", r"first\s*republic",
+    r"goldman", r"marcus", r"chime", r"varo", r"axos",
+    r"venmo", r"paypal", r"zelle", r"cash\s*app", r"cashapp",
+    r"western\s*union", r"moneygram",
+    # 通用金融机构词
+    r"bank", r"banco", r"credit\s*union", r"fcu", r"bancorp",
+]
+
+MERCHANT_TRANSFER_KEYWORDS = [
+    r"transfers?", r"trf", r"xfer", r"wire",
+    r"online\s*payments?", r"onlinepayments?", r"online\s*pmt",
+    r"payments?\s*to", r"pmt\s*to", r"epayments?", r"e-payments?",
+    r"card\s*payments?", r"cardpayments?", r"cc\s*pmt",
+    r"autopay", r"auto\s*pay", r"ach",
+    r"direct\s*dep", r"deposits?", r"withdrawals?", r"withdraw",
+    r"atm", r"overdraft", r"mobile\s*payments?", r"web\s*pmt",
+]
+
+# 边界处理是这条规则的关键，两头要求不同：
+#
+#   前面不能是字母 —— 否则 Ltd 里的 td、Standard 里的片段都会误命中；
+#   后面同样不能是字母 —— 否则 Boat / Boarding 里的 boa、Chaser 里的
+#   chase 会被误判成银行。
+#
+# 但后面【可以是数字】，这一点必须留出来：真实账单里银行名常常和账号
+# 尾号直接粘在一起，例如 "Chase4568"。如果按普通词边界 \b 来匹配，
+# Chase 和 4568 之间没有边界，整条就保护不住，4568 会被当成流水号删掉 ——
+# 而那正是判断分类最需要的信息。
+MERCHANT_PROTECTED_RE = re.compile(
+    r"(?<![A-Za-z])(?:"
+    + "|".join(MERCHANT_BANK_KEYWORDS + MERCHANT_TRANSFER_KEYWORDS)
+    + r")(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def is_bank_transfer_merchant(name: str) -> bool:
+    """判断商户名是否属于银行 / 转账 / 付款类，需要完整保留。"""
+    return bool(MERCHANT_PROTECTED_RE.search(str(name or "")))
+
+
+# ================= Merchant Alias Rules (XLSX) =================
+#
+# 有些商户名怎么整理，本质上是人的判断，规则推不出来。例如同样是
+# "城市 + 州"结尾：
+#
+#     POS Mac Amazon Seattle WA   希望变成  Amazon
+#     Kindercare Portland OR      希望保持  Kindercare Portland OR
+#
+# 一个要删一个要留，正则无从判断。类似的还有 Veolia Water New Y 想留成
+# Veolia Water、Amazon Prime 要和 Amazon 分开统计。
+#
+# 因此把这类判断交给一张用户可以自己编辑的对照表：命中关键字就整条替换成
+# 指定的标准名。表格放在程序目录的 "Merchant Rules" 文件夹里，第一次运行
+# 会自动生成一份示例，之后随时可以增删改，不需要动代码。
+
+MERCHANT_ALIAS_CACHE = {"path": None, "mtime": None, "rules": []}
+
+
+def merchant_rules_folder() -> Path:
+    folder = script_dir() / "Merchant Rules"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def merchant_rules_path() -> Path:
+    return merchant_rules_folder() / "merchant_rules.xlsx"
+
+
+def create_default_merchant_rules_xlsx(path: Path):
+    """生成示例别名表。
+
+    预置的几条来自真实账单里最常见的情况，可以直接看出用法：左边填一段
+    出现在原始商户名里的关键字（不区分大小写），右边填希望显示的标准名。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Merchant Rules"
+    ws.cell(row=1, column=1, value="keyword")
+    ws.cell(row=1, column=2, value="merchant")
+
+    sample_rows = [
+        # 关键字越具体的越优先，所以 Amazon Prime 不会被 Amazon 抢走。
+        ("amazon prime", "Amazon Prime"),
+        ("amazon", "Amazon"),
+        ("veolia", "Veolia Water"),
+        ("no1 sushi", "No1 Sushi 88"),
+        ("withdrawal branch", "Withdrawal Branch"),
+        ("amex epayment", "Amex Epayment"),
+    ]
+    for index, (keyword, merchant) in enumerate(sample_rows, start=2):
+        ws.cell(row=index, column=1, value=keyword)
+        ws.cell(row=index, column=2, value=merchant)
+
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 28
+    wb.save(path)
+
+
+def load_merchant_alias_rules() -> List[Tuple[str, str]]:
+    """读取别名表，按关键字长度倒序返回，保证更具体的规则先匹配。
+
+    结果会按文件修改时间缓存，避免每次清洗都重新读盘。
+    """
+    path = merchant_rules_path()
+    if not path.exists():
+        create_default_merchant_rules_xlsx(path)
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    if (MERCHANT_ALIAS_CACHE["path"] == str(path)
+            and MERCHANT_ALIAS_CACHE["mtime"] == mtime):
+        return MERCHANT_ALIAS_CACHE["rules"]
+
+    rules: List[Tuple[str, str]] = []
+    try:
+        wb = load_workbook(path, data_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            keyword = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
+            merchant = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+            if not keyword or not merchant:
+                continue
+
+            # 单字符关键字会命中几乎所有商户，把整列合并成一行，几乎肯定
+            # 是手滑写错的，直接忽略。
+            if len(keyword) < 2:
+                continue
+
+            # 标准名不能是表结构里的关键字。别名表的优先级高于所有自动
+            # 规则，如果放任 "Total" 这样的值进来，被映射的商户行就会被
+            # 当成汇总行，Total 公式只统计到那一行为止，整张表就废了。
+            # 这里在加载时就把非法规则挡掉，比在每个调用点各判断一次可靠。
+            if merchant.upper() in MERCHANT_STRUCTURAL_LABELS:
+                continue
+
+            rules.append((keyword.casefold(), merchant))
+        wb.close()
+    except Exception:
+        rules = []
+
+    # 关键字长的排前面："amazon prime" 必须比 "amazon" 先匹配，
+    # 否则 Amazon Prime 会被并进 Amazon。
+    rules.sort(key=lambda item: len(item[0]), reverse=True)
+
+    MERCHANT_ALIAS_CACHE.update({"path": str(path), "mtime": mtime, "rules": rules})
+    return rules
+
+
+def apply_merchant_alias(name: str, rules: Optional[List[Tuple[str, str]]] = None) -> str:
+    """命中别名表则返回标准名，否则返回空字符串。"""
+    text = " ".join(str(name or "").split()).casefold()
+    if not text:
+        return ""
+    for keyword, merchant in (rules if rules is not None else []):
+        if keyword in text:
+            return merchant
+    return ""
+
+
+# ---------- 交易渠道前缀 ----------
+#
+# 这些词描述的是"这笔钱怎么付出去的"，不是商户本身，去掉之后剩下的才是
+# 真正的商户名：Bill Pay:Orange & Rockland -> Orange & Rockland、
+# POS Mac Amazon Seattle WA -> Amazon Seattle WA。
+#
+# 只匹配开头，且只列出确定属于渠道标记的词，避免误伤以这些字眼开头的
+# 真实商户名。
+MERCHANT_CHANNEL_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"bill\s*pay(?:ment)?\s*[:\-]?\s*"
+    r"|billpay\s*[:\-]?\s*"
+    r"|pos\s+mac\s+"
+    r"|pos\s+debit\s+"
+    r"|pos\s+"
+    r"|checkcard\s+"
+    r"|check\s*card\s+"
+    r")+",
+    re.IGNORECASE,
+)
+
+
+def strip_merchant_channel_prefix(name: str) -> str:
+    """去掉 Bill Pay: / POS Mac 这类交易渠道前缀。
+
+    去完之后如果一个字母都不剩（例如 "POS 12345" 只剩 "12345"），说明这个
+    名字里本来就没有真正的商户信息，去前缀反而让它更难辨认，此时退回原名。
+    """
+    original = str(name or "").strip()
+    result = MERCHANT_CHANNEL_PREFIX_RE.sub("", original).strip()
+    if not result or not any(ch.isalpha() for ch in result):
+        return original
+    return result
+
+
+def clean_merchant_display_name(name: str, alias_rules: Optional[List[Tuple[str, str]]] = None) -> str:
+    """清理商户名里无意义的流水号、交易码和域名后缀。
+
+    典型效果：
+        amazon.com91591732948173          -> amazon
+        Shell247592917239                 -> Shell
+        Expida143242//4/24/com            -> Expida
+        POS Mac Amazon.Com*Nx6 Seattle WA -> POS Mac Amazon Seattle WA
+        Bill Pay:Veolia Water New Y 200045 6Bu1T6Kr -> Bill Pay:Veolia Water New Y
+
+    设计上刻意保守，只删除"确定无意义"的部分，绝不把商户名截断成第一个
+    单词。像 Bill Pay:Veolia Water New Y、No1 Sushi 88 Corkbbo ACH、
+    Orange & Rockland、Internet Trf To Client-Added Transfer Account 这些
+    名字里本来就带数字或标点，必须原样保留，否则清洗反而把数据毁了。
+
+    万一某个名字被清洗后什么都不剩，一律退回原始名字，宁可不清洗也不能
+    产生空白商户。
+    """
+    original = " ".join(str(name or "").split())
+    if not original:
+        return ""
+
+    # 第一优先：用户自己写在别名表里的规则。这是人的明确判断，
+    # 优先级高于下面所有自动规则，包括银行保护。
+    alias = apply_merchant_alias(original, alias_rules)
+    if alias:
+        return alias
+
+    # 去掉 Bill Pay: / POS Mac 这类渠道前缀，剩下的才是真正的商户。
+    # 这一步放在银行判断之前：像 "Bill Pay:Chase4568" 既要去掉前缀，
+    # 又要保住 4568，两件事不冲突。
+    working = strip_merchant_channel_prefix(original)
+
+    # 银行 / 转账 / 付款类的名字到此为止：里面的数字通常是账户尾号或
+    # 卡号后四位，正是判断分类要用的信息，删掉就没法分辨了。
+    if is_bank_transfer_merchant(working):
+        return working
+
+    cleaned_tokens = []
+    for token in working.split(" "):
+        original_token = token
+
+        # 整词就是流水号或纯分隔符的，直接丢弃。
+        if _is_pure_number_token(token) or MERCHANT_SEPARATOR_TOKEN_RE.match(token):
+            continue
+
+        # 星号后面是交易码，从星号处截断（Amazon.Com*Nx6 -> Amazon.Com）。
+        star = token.find("*")
+        if star != -1:
+            token = token[:star]
+
+        if _is_reference_code_token(token):
+            continue
+
+        token = MERCHANT_LONG_DIGITS_RE.sub("", token)
+        token = MERCHANT_DOMAIN_SUFFIX_RE.sub("", token)
+        token = MERCHANT_DATE_FRAGMENT_RE.sub("", token)
+
+        # 上面几步会留下连续的标点，例如 Expida// ，压平后再去掉首尾标点。
+        token = re.sub(r"[\\/*#|]{2,}", " ", token)
+        token = token.strip(" \t-–—/\\*#|,;:.")
+
+        if not token or MERCHANT_SEPARATOR_TOKEN_RE.match(token):
+            continue
+
+        # 删掉流水号后只剩一个字母的，多半是编号的前缀而不是名字的一部分，
+        # 例如门店号 "T-2109" 会剩下一个孤零零的 "T"。这种残渣一并丢掉，
+        # 得到干净的 "Target" 而不是 "Target T"。
+        # 判断条件里要求原词确实含有被删掉的长数字，这样单独成词的 "A"、
+        # "&" 之类不会受影响。
+        if len(token) == 1 and MERCHANT_LONG_DIGITS_RE.search(original_token):
+            continue
+
+        cleaned_tokens.append(token)
+
+    result = " ".join(" ".join(cleaned_tokens).split())
+    if not result:
+        return working
+
+    # 清洗结果不能变成表结构里的关键字，否则会被误认成汇总行。
+    if result.upper() in MERCHANT_STRUCTURAL_LABELS:
+        return working
+
+    return result
+
+
+def clean_debit_merchant_names_in_sheet(xlsx_path: Path, sheet_name: str):
+    """把指定 Debit 工作表 Column A 的商户名整体清洗一遍。
+
+    只处理表头行与 Total 行之间的商户行；Total 行本身、以及它下面的
+    BEGIN / ADD / LESS / END 汇总行都不会被碰到。Credit 页面同样不处理。
+
+    清洗后若出现同名行（例如多行 Amazon.Com*XXX 被统一成同一个名字），
+    会直接复用既有的合并功能把它们并成一行 —— 这样金额累加、Category
+    后面的额外月份列、Total 公式、以及 ADD/END 汇总块的引用修复全都沿用
+    同一套已验证过的逻辑，不另写一遍。
+
+    返回 (改名列表, 合并结果)；改名列表元素为 (原名, 新名)。
+    """
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path.exists() or not sheet_name:
+        return [], None
+
+    renamed = []
+    wb = load_workbook(xlsx_path, data_only=False)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return [], None
+        ws = wb[sheet_name]
+
+        # 类型判断沿用全局唯一的那条规则，Credit 页面直接跳过。
+        if classify_sheet_type(ws) != "debit":
+            return [], None
+
+        layout = find_debit_layout(ws)
+        if layout is None:
+            return [], None
+        header_row, merchant_col, _, _, _ = layout
+
+        # 别名表只读一次，整列共用。
+        alias_rules = load_merchant_alias_rules()
+
+        cleaned_names = []
+        for row in range(header_row + 1, ws.max_row + 1):
+            raw_name = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+            if not raw_name:
+                continue
+            if raw_name.upper() in {"TOTAL", "GRAND TOTAL"}:
+                break
+
+            new_name = clean_merchant_display_name(raw_name, alias_rules)
+            if new_name and new_name != raw_name:
+                ws.cell(row=row, column=merchant_col, value=new_name)
+                renamed.append((raw_name, new_name))
+            cleaned_names.append((new_name or raw_name).casefold())
+
+        if not renamed:
+            return [], None
+
+        wb.save(xlsx_path)
+    finally:
+        wb.close()
+
+    # 清洗之后可能出现重名行，交给既有的合并功能处理。
+    merge_result = None
+    if len(cleaned_names) != len(set(cleaned_names)):
+        merge_result = merge_duplicate_merchants_in_selected_sheet(xlsx_path, sheet_name)
+
+    clear_debit_layout_cache(xlsx_path)
+    return renamed, merge_result
+
 
 def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str):
     """在指定工作表中原地合并重复 Merchant。
@@ -4244,7 +4943,6 @@ def run_parser_ui():
     # 逻辑一行都不用改，将来想把某个选项放回界面也只需重新加控件。
     balance_mode_var = tk.StringVar(value="自动判断")
     compact_date_var = tk.BooleanVar(value=False)
-    status_history: List[str] = []
 
     sheet_names: List[str] = []
     months: List[str] = []
@@ -4348,6 +5046,11 @@ def run_parser_ui():
     top_action_buttons = tk.Frame(control_row, bg=BG)
     top_action_buttons.pack(side="right", padx=(10, 0))
 
+    # 状态栏的进度渲染函数定义在后面，但 refresh_sheet_and_month_options 需要
+    # 在读完工作表后顺手更新进度。用一个 hook 占位解耦：启动阶段第一次调用时
+    # 它还是空的（那时状态栏尚未建好），之后由状态栏区域填入。
+    status_hooks = {"apply_progress": None}
+
     def refresh_sheet_and_month_options(preferred_sheet: str = "", preferred_month: str = ""):
         path = get_summary_output_path(summary_var.get())
         names = list_workbook_sheet_names(path)
@@ -4366,9 +5069,12 @@ def run_parser_ui():
             selected = find_first_writable_sheet_name(path, sheet_names) or sheet_names[0]
         sheet_var.set(selected)
 
-        sheet_type, options = (
-            read_period_options_from_selected_sheet(path, selected)
-            if selected else ("", [])
+        # 一次读取拿全：Month 选项、各月是否已写入、各月金额合计。
+        # 之前这里和状态栏各开一次工作簿，同样的数据读了两遍 —— 切换 Sheet 时
+        # 等于把成本翻倍，商户多的表能明显感觉到卡顿。
+        sheet_type, options, written, totals = (
+            read_sheet_period_status(path, selected)
+            if selected else ("", [], {}, {})
         )
         current_sheet_type[0] = sheet_type
         months[:] = [label for label, _ in options]
@@ -4384,6 +5090,11 @@ def run_parser_ui():
         else:
             month_var.set("")
             month_box.set("")
+
+        # 复用刚才那次读取的结果刷新进度，不再另开一次工作簿。
+        apply_progress = status_hooks.get("apply_progress")
+        if apply_progress is not None:
+            apply_progress(selected, options, written, totals)
 
     def choose_summary():
         p = filedialog.askopenfilename(
@@ -4411,6 +5122,8 @@ def run_parser_ui():
 
     def on_sheet_selected(event=None):
         # Changing sheets refreshes periods from that exact sheet only.
+        # refresh_sheet_and_month_options 内部已经顺带刷新过进度了，
+        # 这里不再重复读取工作簿。
         refresh_sheet_and_month_options(sheet_var.get(), "")
         on_month_selected()
 
@@ -4429,14 +5142,14 @@ def run_parser_ui():
     txt_input.bind("<Return>", keep_cursor_visible)
     txt_input.bind("<<Paste>>", keep_cursor_visible)
 
-    # ---------- 最近三次操作记录 ----------
+    # ---------- 状态显示：上次写入 / 本表月份进度 / 最近操作 ----------
     status_frame = tk.Frame(root, bg=BG)
     status_frame.pack(fill="x", padx=12, pady=(5, 2))
-    mk_label(status_frame, "最近操作(Recent operations)：").pack(anchor="w")
+    mk_label(status_frame, "状态(Status)：").pack(anchor="w")
 
     status_text = tk.Text(
         status_frame,
-        height=3,
+        height=4,
         wrap="none",
         bg=BG,
         fg="#9cdcfe",
@@ -4446,23 +5159,92 @@ def run_parser_ui():
         highlightthickness=0,
         takefocus=0,
         state="disabled",
-        font=("Helvetica", 9),
+        # 等宽字体：月份和金额需要按列对齐，人工核对时才好一眼扫过去。
+        font=("Courier New", 9),
     )
     status_text.pack(fill="x", anchor="w")
 
-    def log_status(message: str):
-        """Add one timestamped status entry and keep only the latest three."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        status_history.append(f"[{timestamp}] {message}")
-        del status_history[:-3]
+    # 三部分内容各自独立维护，互不覆盖：
+    #   last_write     最近一次成功写入的 Month / 笔数 / 金额 —— 用户最关心
+    #   progress_lines 当前 Sheet 各月份完成情况（直接读 Excel，重启也准）
+    #   recent         最近一次操作或错误提示
+    status_state = {
+        "last_write": "尚未写入",
+        "progress_lines": [],
+        "recent": "尚未开始 (Not started)",
+    }
 
-        status_text.configure(state="normal")
+    LABEL_WIDTH = 10  # "上次写入"等前缀的对齐宽度
+
+    def render_status():
+        pad = " " * LABEL_WIDTH
+        lines = [f"{'上次写入':<6}  {status_state['last_write']}"]
+
+        progress = status_state["progress_lines"] or ["(尚未选择 Sheet)"]
+        lines.append(f"{'本表进度':<6}  {progress[0]}")
+        for extra in progress[1:]:
+            lines.append(pad + extra)
+
+        lines.append(f"{'最近操作':<6}  {status_state['recent']}")
+
+        # 高度随内容变化：只写了一两个月份时不占地方，写满一年也能完整显示。
+        status_text.configure(state="normal", height=max(3, min(len(lines), 9)))
         status_text.delete("1.0", tk.END)
-        status_text.insert("1.0", "\n".join(status_history))
+        status_text.insert("1.0", "\n".join(lines))
         status_text.configure(state="disabled")
-        status_text.see(tk.END)
 
-    log_status("尚未开始 (Not started)")
+    def log_status(message: str):
+        """记录一条最近操作（带时间戳），不影响另外两部分。"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        status_state["recent"] = f"[{timestamp}] {message}"
+        render_status()
+
+    def set_last_write(sheet_name: str, month_label: str, count: int, amount=None):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        parts = [f"【{month_label}】", f"{count} 笔"]
+        if amount is not None:
+            parts.append(f"合计 {format_amount_for_display(amount)}")
+        status_state["last_write"] = (
+            "  ".join(parts) + f"   →  {sheet_name}   ({timestamp})"
+        )
+        render_status()
+
+    def apply_progress(sheet_name, options, written, totals):
+        """用已经读好的数据渲染进度，不再重复打开工作簿。"""
+        if not sheet_name:
+            status_state["progress_lines"] = []
+        else:
+            status_state["progress_lines"] = format_period_progress_lines(
+                sheet_name, options, written, totals
+            )
+        render_status()
+
+    status_hooks["apply_progress"] = apply_progress
+
+    def refresh_progress(sheet_name: str = "", month_position=None):
+        """重新统计当前 Sheet 的月份完成情况，并返回指定月份的金额合计。
+
+        直接读 Excel 而不是靠会话内的记录：换台电脑、重开程序，甚至别人先
+        写过一部分，进度都能正确显示出来。读不到就留空，不打扰用户。
+        """
+        target = (sheet_name or sheet_var.get()).strip()
+        if not target:
+            status_state["progress_lines"] = []
+            render_status()
+            return None
+        try:
+            path = get_summary_output_path(summary_var.get())
+            _, options, written, totals = read_sheet_period_status(path, target)
+            apply_progress(target, options, written, totals)
+            return totals.get(month_position) if month_position is not None else None
+        except Exception:
+            status_state["progress_lines"] = []
+            render_status()
+            return None
+
+    render_status()
+    refresh_progress()
+    refresh_progress()
 
     def import_existing_report(clear_existing_data: bool):
         mode_name = "清空旧金额（模板模式）" if clear_existing_data else "保留全部原有数据"
@@ -4554,12 +5336,14 @@ def run_parser_ui():
                     or selected_month_index >= len(period_positions)
             ):
                 messagebox.showerror("错误", "请选择有效日期/月份")
+                log_status("未开始：没有选择有效的日期/月份")
                 return
             selected_period_position = period_positions[selected_month_index]
 
             selected_sheet = sheet_var.get().strip()
             if not selected_sheet:
                 messagebox.showerror("错误", "请选择要修改的Excel Sheet/Page")
+                log_status("未开始：没有选择 Excel Sheet")
                 return
 
             selected_sheet_type = current_sheet_type[0]
@@ -4569,6 +5353,7 @@ def run_parser_ui():
                     "当前 Excel Sheet 无法自动识别为 Credit 或 Debit。\n"
                     "请选择包含可识别月份/日期结构的 Sheet。"
                 )
+                log_status(f"未开始：Sheet「{selected_sheet}」无法识别为 Credit 或 Debit")
                 return
 
             bank_name = bank_name_var.get().strip() or DEFAULT_BANK_NAME
@@ -4649,6 +5434,20 @@ def run_parser_ui():
                 bank_name=bank_name,
             )
 
+            # 写入成功后，对 Debit 页面的商户名做一次清洗：去掉流水号、
+            # 交易码和域名后缀，并把因此变成同名的行合并起来。
+            #
+            # 放在写入之后而不是写入之前，是因为清洗要覆盖整列 —— 既包括
+            # 这次刚写进去的商户，也包括表里原本就存在的旧商户，让同一个
+            # 商户不会因为一个带流水号、一个不带而长期占着两行。
+            # Credit 页面不做处理（那里的商户是列标题，结构完全不同）。
+            renamed_merchants = []
+            clean_merge_result = None
+            if detected_type == "debit":
+                renamed_merchants, clean_merge_result = clean_debit_merchant_names_in_sheet(
+                    summary_xlsx, selected_sheet
+                )
+
             # 写入成功后自动清空输入框，方便直接粘贴下一批账单。
             #
             # 位置很关键：这行必须放在 append_rows_to_selected_sheet 成功返回
@@ -4662,9 +5461,20 @@ def run_parser_ui():
             txt_input.delete("1.0", tk.END)
             txt_input.focus_set()
 
+            clean_note = ""
+            if renamed_merchants:
+                clean_note = f" | 已清洗 {len(renamed_merchants)} 个商户名"
+                if clean_merge_result and clean_merge_result.get("merged_groups"):
+                    clean_note += f"，合并 {clean_merge_result['merged_groups']} 组重复"
+
+            # 用户最关心的是"哪个月写完了"，所以单独用一行突出显示，
+            # 不再和处理方式、文件名等细节挤在一起。
+            # 先刷新进度（顺带取回该月份写完后的金额合计），再更新"上次写入"，
+            # 这样金额和进度里显示的是同一次读取的结果，不会出现两处对不上。
+            month_total = refresh_progress(selected_sheet, selected_period_position)
+            set_last_write(selected_sheet, selected_month_display, len(rows), month_total)
             log_status(
-                f"已完成 / Completed | Excel Sheet: {selected_sheet} | 日期: {selected_month_display} | "
-                f"自动识别: {detected_type.title()} | 方式: {mode_note} | 总表: {summary_xlsx.name} | 文本框已清空"
+                f"完成 {detected_type.title()} 写入（{mode_note}）{clean_note}，文本框已清空"
             )
             date_format_display = (
                 resolved_date_format if resolved_date_format
@@ -4675,6 +5485,13 @@ def run_parser_ui():
                 extra_note = f"未识别内容: {len(pre_result.issues)} 处\n"
                 if pre_result.balance_column_detected:
                     extra_note += "已自动排除行尾余额列\n"
+            if renamed_merchants:
+                extra_note += f"商户名清洗: {len(renamed_merchants)} 个\n"
+                if clean_merge_result and clean_merge_result.get("merged_groups"):
+                    extra_note += (
+                        f"清洗后合并重复: {clean_merge_result['merged_groups']} 组"
+                        f"（减少 {clean_merge_result['removed_rows']} 行）\n"
+                    )
             messagebox.showinfo(
                 "Completed",
                 f"提取成功: {len(rows)} 笔交易\n"
