@@ -1736,24 +1736,40 @@ def create_default_category_rules_xlsx(path: Path):
     wb.save(path)
 
 
-def load_category_rules() -> List[Tuple[str, str]]:
+# 分类规则在程序运行期间不会变（用户都是运行前就调整好表格），因此只在
+# 第一次用到时读一次，之后一直用缓存。原来每次点 Start 都要把这个 xlsx
+# 重新打开一遍，纯属浪费。
+CATEGORY_RULES_CACHE: Dict[str, List[Tuple[str, str]]] = {}
+
+
+def load_category_rules(force_reload: bool = False) -> List[Tuple[str, str]]:
     path = category_rules_path()
+    key = str(path)
+
+    if not force_reload and key in CATEGORY_RULES_CACHE:
+        return CATEGORY_RULES_CACHE[key]
 
     if not path.exists():
         create_default_category_rules_xlsx(path)
 
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-
     rules = []
+    try:
+        wb = load_workbook(path, data_only=True)
+        ws = wb.active
 
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        merchant = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
-        category = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            merchant = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
+            category = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
 
-        if merchant and category:
-            rules.append((normalize_merchant_for_category(merchant), category))
+            if merchant and category:
+                rules.append((normalize_merchant_for_category(merchant), category))
+        wb.close()
+    except Exception:
+        # 规则表打不开（正被 Excel 占用、文件损坏等）不应该拖垮写入流程，
+        # 当作"暂时没有规则"继续走，商户分类会退回历史学习和 REVIEW。
+        rules = []
 
+    CATEGORY_RULES_CACHE[key] = rules
     return rules
 
 
@@ -1939,7 +1955,64 @@ def get_smart_category_for_merchant(
     return fallback, "review", best_score
 
 
-# ================= 预处理删除内容 =================
+# ================= Check Image 手工输入 =================
+#
+# 有些银行账单里的支票是扫描图片，金额和收款人只能人工看着图片敲进来。
+# 这类数据没有日期（月份由界面上的下拉框决定），格式就是每行"商户 金额"：
+#
+#     BUBUGAO 600
+#     HUAnchauhjun 700.28
+#
+# 手写录入时整数一般不会补 .00，所以 600 和 600.00 都要认，写进 Excel 时
+# 统一补成两位小数。
+
+CHECK_INPUT_AMOUNT_RE = re.compile(
+    r"^(?P<merchant>.*?)[\s\t]+"
+    r"(?P<amount>\(?\s*[-+]?\s*\$?\s*[\d,]+(?:\.\d{1,2})?\s*\)?)$"
+)
+
+
+def parse_check_image_lines(text: str):
+    """把"商户 金额"格式的手工输入解析成写入用的交易行。
+
+    金额取每行【最后】一段数字，前面剩下的全部算商户名 —— 这样商户名里
+    带空格（HOME DEPOT）或数字（No1 Sushi 88）都不会被拆错。
+
+    返回 (rows, issues)：
+      rows   [(商户, "金额字符串", 来源标记)]，金额已补足两位小数
+      issues [(行号, 原文, 原因)]，认不出来的行不会被静默丢掉
+    """
+    rows = []
+    issues = []
+
+    for index, raw_line in enumerate(str(text or "").splitlines(), start=1):
+        line = " ".join(raw_line.split())
+        if not line:
+            continue
+
+        match = CHECK_INPUT_AMOUNT_RE.match(line)
+        if not match:
+            issues.append((index, line, "没找到金额"))
+            continue
+
+        merchant = clean_merchant(match.group("merchant"))
+        if not merchant:
+            issues.append((index, line, "缺少商户名"))
+            continue
+
+        try:
+            # clean_amount 已经能处理 $、千分位逗号、括号负数和负号。
+            value = float(clean_amount(match.group("amount")))
+        except (TypeError, ValueError):
+            issues.append((index, line, "金额无法识别"))
+            continue
+
+        rows.append((merchant, f"{value:.2f}", "check-image"))
+
+    return rows, issues
+
+
+
 
 def parse_remove_items(raw: str) -> List[str]:
     if not raw:
@@ -2254,45 +2327,137 @@ def style_debit_summary_sheet(ws, last_row: int):
     ws.auto_filter.ref = f"A1:O{last_row}"
 
 
+def quote_sheet_name_for_formula(sheet_name: str) -> str:
+    """把工作表名转成可以直接放进公式的形式。
+
+    含空格、井号、中文等字符的表名必须用单引号包住，名字里本身的单引号
+    要写成两个（Excel 的转义规则）：Bob's Bank -> 'Bob''s Bank'。
+    """
+    name = str(sheet_name or "")
+    escaped = name.replace("'", "''")
+    if name and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return name
+    return f"'{escaped}'"
+
+
+def find_debit_total_row(ws, layout=None) -> Optional[int]:
+    """按 Column A 的 Total 标签定位 Debit 表的合计行。
+
+    不能用 ws.max_row 代替：真实模板的 Total 下面往往还有 BEGIN / ADD /
+    LESS / END 汇总块，最后一行是 END 而不是 Total。拿 max_row 当合计行，
+    跨表引用就会指到汇总块上，读出来的数字完全不对。
+    """
+    layout = layout or find_debit_layout(ws)
+    if layout is None:
+        return None
+    header_row, merchant_col, _, _, _ = layout
+    for row in range(header_row + 1, ws.max_row + 1):
+        label = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+        if label.upper() in {"TOTAL", "GRAND TOTAL"}:
+            return row
+    return None
+
+
+def find_credit_debit_sheet_pair(wb):
+    """找出需要联动的一对 Credit / Debit 工作表。
+
+    判定完全依据 Sheet 的结构类型（Column A 是否有超过 5 个月份/日期），
+    不依赖 "Credit Summary" / "debit summary" 这类固定名字，导入的公司
+    报表用中文名、账号名一样能识别。
+
+    只有在【恰好一张 Credit 表 + 一张可写 Debit 表】时才自动联动。工作簿里
+    有多张账户页时，谁对应谁无从判断，宁可什么都不做，也不能瞎连一个把
+    数字算错。
+    """
+    credit_sheets = []
+    debit_sheets = []
+    for ws in wb.worksheets:
+        if classify_sheet_type(ws) == "credit":
+            if locate_credit_columns(ws)[0] is not None:
+                credit_sheets.append(ws)
+        elif find_debit_layout(ws) is not None:
+            debit_sheets.append(ws)
+
+    if len(credit_sheets) == 1 and len(debit_sheets) == 1:
+        return credit_sheets[0], debit_sheets[0]
+    return None, None
+
+
 def sync_credit_debit_from_debit_sheet(wb):
-    if "Credit Summary" not in wb.sheetnames:
+    """把 Credit 表的支出列链接到 Debit 表的月度合计。
+
+    全部按结构定位，不依赖任何表头文字或工作表名字：
+
+      Credit 侧：期间行取自 Column A；支出列 = 最右侧表头列 - 1
+                 （固定顺序 ... 本期收入合计 | 本期支出 | 期末余额）
+      Debit 侧：合计行按 Column A 的 Total 标签定位；月份列取自 Row 1
+
+    两侧的月份先按标签配对，配不上再按顺序配对 —— 两张表本来就是用同一份
+    月份列表生成的，顺序天然一致。
+
+    只写入【空单元格或本来就是公式】的格子。写着数字的格子是用户手工填的
+    支出金额，属于用户数据，不能被自动联动覆盖。
+    """
+    ws_credit, ws_debit = find_credit_debit_sheet_pair(wb)
+    if ws_credit is None or ws_debit is None:
         return
 
-    if DEBIT_SHEET_NAME not in wb.sheetnames:
+    debit_layout = find_debit_layout(ws_debit)
+    if debit_layout is None:
+        return
+    debit_header_row, _, debit_month_cols, debit_total_col, _ = debit_layout
+
+    debit_total_row = find_debit_total_row(ws_debit, debit_layout)
+    if debit_total_row is None:
         return
 
-    ws_credit = wb["Credit Summary"]
-    ws_debit = wb[DEBIT_SHEET_NAME]
-
-    debit_total_row = ws_debit.max_row
-
-    header_col_map = {}
-    for col in range(2, ws_credit.max_column + 1):
-        val = ws_credit.cell(row=2, column=col).value
-        if val:
-            header_col_map[str(val).strip()] = col
-
-    if CREDIT_DEBIT_HEADER not in header_col_map:
+    credit_header_row, credit_header_map = locate_credit_columns(ws_credit)
+    if credit_header_row is None or not credit_header_map:
         return
+    # locate_credit_columns 里这三个键是按【列位置】覆盖上去的，与表头文字无关。
+    credit_begin_col = credit_header_map[CREDIT_BEGIN_HEADER]
+    credit_debit_col = credit_header_map[CREDIT_DEBIT_HEADER]
 
-    debit_col_credit = header_col_map[CREDIT_DEBIT_HEADER]
-
-    for idx, month in enumerate(CREDIT_MONTHS, start=2):
-        credit_row = CREDIT_MONTH_ROWS[month]
-        debit_month_col_letter = excel_col_letter(idx)
-        ws_credit.cell(
-            row=credit_row,
-            column=debit_col_credit,
-            value=f"='{DEBIT_SHEET_NAME}'!{debit_month_col_letter}{debit_total_row}"
-        )
-        ws_credit.cell(row=credit_row, column=debit_col_credit).number_format = "0.00"
-
-    ws_credit.cell(
-        row=15,
-        column=debit_col_credit,
-        value=f"='{DEBIT_SHEET_NAME}'!N{debit_total_row}"
+    credit_period_rows, credit_total_row = find_credit_period_rows(
+        ws_credit, credit_header_row, credit_begin_col
     )
-    ws_credit.cell(row=15, column=debit_col_credit).number_format = "0.00"
+    if not credit_period_rows:
+        return
+
+    sheet_ref = quote_sheet_name_for_formula(ws_debit.title)
+
+    # 月份标签 -> Debit 月份列，用于两侧配对。
+    debit_label_to_col = {}
+    for col in debit_month_cols:
+        label = display_cell_text(ws_debit.cell(row=debit_header_row, column=col)).strip()
+        if label and label.upper() not in debit_label_to_col:
+            debit_label_to_col[label.upper()] = col
+
+    def link(target_row, formula):
+        cell = ws_credit.cell(row=target_row, column=credit_debit_col)
+        if cell.value is None or _is_formula_cell(cell):
+            cell.value = formula
+            cell.number_format = "0.00"
+
+    for index, credit_row in enumerate(credit_period_rows):
+        label = display_cell_text(
+            ws_credit.cell(row=credit_row, column=credit_begin_col - 1)
+        ).strip().upper()
+
+        debit_col = debit_label_to_col.get(label)
+        if debit_col is None:
+            # 标签对不上就按顺序配对：两张表的月份本来就是同一份列表生成的。
+            if index < len(debit_month_cols):
+                debit_col = debit_month_cols[index]
+            else:
+                continue
+
+        link(credit_row,
+             f"={sheet_ref}!{excel_col_letter(debit_col)}{debit_total_row}")
+
+    if credit_total_row:
+        link(credit_total_row,
+             f"={sheet_ref}!{excel_col_letter(debit_total_col)}{debit_total_row}")
 
 
 # ================= 已有公司报表模板导入 =================
@@ -2707,7 +2872,16 @@ def extract_month_labels_from_sheet(ws) -> List[str]:
 
 
 def find_credit_period_rows(ws, header_row: int, begin_col: int) -> Tuple[List[int], Optional[int]]:
-    """Return all labeled period rows and the TOTAL row for a Credit layout."""
+    """Return all labeled period rows and the TOTAL row for a Credit layout.
+
+    判断完全靠结构，不匹配任何标签文字：Column A 里长得像月份/日期的行就是
+    期间行；往下第一个有标签、但不是月份/日期的行，就是合计行。
+
+    早期版本是拿标签去比对 "TOTAL" / "GRAND TOTAL"。这在中文报表里直接失效 ——
+    表里写的是"合计"，比对不上，于是"合计"那一行被当成了又一个期间行，
+    真正的合计行反而落到了表格外面。改成看"是不是月份/日期"之后，合计行
+    叫什么名字都无所谓。
+    """
     if begin_col <= 1:
         return [], None
 
@@ -2716,13 +2890,16 @@ def find_credit_period_rows(ws, header_row: int, begin_col: int) -> Tuple[List[i
     total_row: Optional[int] = None
 
     for row in range(header_row + 1, ws.max_row + 1):
-        label = display_cell_text(ws.cell(row=row, column=label_col)).strip()
-        key = label.upper()
-        if key in {"TOTAL", "GRAND TOTAL"}:
-            total_row = row
-            break
-        if label:
+        cell = ws.cell(row=row, column=label_col)
+        label = display_cell_text(cell).strip()
+        if not label:
+            continue
+        if looks_like_period_header(cell):
             period_rows.append(row)
+            continue
+        # 有标签却不是月份/日期，说明期间区到此为止，这一行就是合计行。
+        total_row = row
+        break
 
     # Some templates may not already contain a TOTAL row.
     if total_row is None and period_rows:
@@ -2731,23 +2908,26 @@ def find_credit_period_rows(ws, header_row: int, begin_col: int) -> Tuple[List[i
 
 
 def extract_month_labels_from_income_sheet(ws) -> List[str]:
-    """Read every date/period label from an Income/Credit page."""
-    limit = min(ws.max_row, 100)
-    begin_row = None
-    begin_col = None
-    for row in range(1, limit + 1):
-        for col in range(1, ws.max_column + 1):
-            if normalized_header_key(ws.cell(row=row, column=col).value) == CREDIT_BEGIN_HEADER:
-                begin_row, begin_col = row, col
-                break
-        if begin_row is not None:
-            break
+    """Read every date/period label from an Income/Credit page.
 
-    if begin_row is not None and begin_col is not None and begin_col > 1:
-        period_rows, _ = find_credit_period_rows(ws, begin_row, begin_col)
-        labels = [display_cell_text(ws.cell(row=r, column=begin_col - 1)) for r in period_rows]
-        if labels:
-            return labels
+    定位靠结构（locate_credit_columns 是按列位置算出来的），不再去找
+    "BEGIN BALANCE" 这个表头文字 —— 中文报表里写的是"期初余额"，
+    按文字找根本找不到。
+
+    注：当前这个函数只被 discover_source_report_structure 调用，而后者
+    暂时没有任何调用方。保留并修正它，是为了将来复用时不会踩到同一个坑。
+    """
+    header_row, header_map = locate_credit_columns(ws)
+    if header_row is not None and header_map:
+        begin_col = header_map[CREDIT_BEGIN_HEADER]
+        if begin_col > 1:
+            period_rows, _ = find_credit_period_rows(ws, header_row, begin_col)
+            labels = [
+                display_cell_text(ws.cell(row=r, column=begin_col - 1))
+                for r in period_rows
+            ]
+            if labels:
+                return labels
 
     return extract_month_labels_from_sheet(ws)
 
@@ -3399,8 +3579,17 @@ def read_sheet_period_status(path: Path, sheet_name: str):
     try:
         if sheet_name not in wb.sheetnames:
             return "", [], {}, {}
-        ws = wb[sheet_name]
+        return collect_period_status_on_worksheet(path, wb[sheet_name], sheet_name)
+    finally:
+        wb.close()
 
+
+def collect_period_status_on_worksheet(path: Path, ws, sheet_name: str):
+    """在【已经打开的】工作表上统计月份状态，不做任何文件读写。
+
+    写入流程结束时可以直接复用手上那份工作簿算出进度，省掉再开一次文件。
+    """
+    if True:
         sheet_type = get_cached_sheet_type(path, sheet_name)
         if sheet_type is None:
             sheet_type = classify_sheet_type(ws)
@@ -3466,8 +3655,6 @@ def read_sheet_period_status(path: Path, sheet_name: str):
             written[col] = found
             totals[col] = total
         return "debit", options, written, totals
-    finally:
-        wb.close()
 
 
 def format_amount_for_display(value: float) -> str:
@@ -3829,6 +4016,15 @@ def safe_set_merged_value(ws, row: int, col: int, value):
     ws.cell(row=row, column=col, value=value)
 
 
+def _is_formula_cell(cell) -> bool:
+    """单元格里装的是不是公式。
+
+    修复公式时只动公式格：写死的数字属于用户手工填写的数据，绝不能覆盖。
+    """
+    value = cell.value
+    return isinstance(value, str) and value.lstrip().startswith("=")
+
+
 def rebuild_credit_total_row_formulas(ws):
     """Rebuild every Credit TOTAL formula after dynamic column insertion.
 
@@ -3933,6 +4129,43 @@ def rebuild_credit_total_row_formulas(ws):
             total_credit_cell = ws.cell(row=row, column=total_credit_col)
             total_credit_cell.value = f"=SUM({start_ref}:{end_ref})"
             total_credit_cell.number_format = "0.00"
+
+    # 每期的 ENDING 与 BEGIN 余额链同样必须重建。
+    #
+    # openpyxl 的 insert_cols 只把单元格整体右移，不会改写公式文字。所以插入
+    # 一个新商户列之后，原来写着 "=B3+D3-E3" 的期末公式仍然指着 D、E 两列 ——
+    # 而那两列现在已经变成了商户列和存款列，算出来的数字完全是错的。同理，
+    # 期初列里 "=F3" 这种指向上一期期末的引用，也会掉头指到 TOTAL CREDIT 上。
+    #
+    # 这里全部按【列位置】重建，不看任何表头文字：
+    #     A = 期间标签
+    #     B = 期初余额（CREDIT_BEGIN_COL）
+    #     C .. TotalCredit-1 = 动态商户列
+    #     ending_col     = 最右侧有内容的表头列
+    #     debit_col      = ending_col - 1
+    #     total_credit_col = ending_col - 2
+    #
+    # 只重写【本来就是公式】的单元格：期初第一行常常是用户手填的数字，
+    # 有些模板的期末也直接填死数值，这些属于用户数据，不能被覆盖。
+    debit_col = ending_col - 1
+    if total_credit_col >= 3 and debit_col > total_credit_col:
+        for index, row in enumerate(period_rows):
+            ending_cell = ws.cell(row=row, column=ending_col)
+            if _is_formula_cell(ending_cell):
+                begin_ref = ws.cell(row=row, column=CREDIT_BEGIN_COL).coordinate
+                credit_ref = ws.cell(row=row, column=total_credit_col).coordinate
+                debit_ref = ws.cell(row=row, column=debit_col).coordinate
+                ending_cell.value = f"={begin_ref}+{credit_ref}-{debit_ref}"
+                ending_cell.number_format = "0.00"
+
+            if index > 0:
+                begin_cell = ws.cell(row=row, column=CREDIT_BEGIN_COL)
+                if _is_formula_cell(begin_cell):
+                    previous_ending = ws.cell(
+                        row=period_rows[index - 1], column=ending_col
+                    ).coordinate
+                    begin_cell.value = f"={previous_ending}"
+                    begin_cell.number_format = "0.00"
 
     for col in range(3, ending_col):
         col_letter = excel_col_letter(col)
@@ -4179,6 +4412,88 @@ def update_debit_sheet_in_place(ws, rows, selected_period_col: int, layout=None)
         shift_local_row_references(
             ws, old_total_row, offset, min_row=total_row + 1
         )
+
+
+def write_statement_and_finalize(
+        xlsx_path: Path, sheet_name: str, rows,
+        selected_period_label: str, selected_period_position: int,
+        expected_sheet_type: str = "", bank_name: str = DEFAULT_BANK_NAME,
+        clean_merchants: bool = True,
+):
+    """一次开关文件完成全部写入工作。
+
+    这是 Start 按钮真正调用的入口。它把原本各自独立打开文件的四个步骤
+    串到同一次工作簿会话里：
+
+        写入交易 -> 清洗商户名 -> 合并重名 -> 统计月份进度 -> 保存一次
+
+    为什么必须这样：大报表（多账户页、每页几百商户）用 openpyxl 读一次要
+    半秒、写一次要 0.4 秒。原来这四步各开一次文件，一次 Start 光是读写
+    工作簿就有 6 次读 + 3 次写，占掉了绝大部分时间 —— 这也解释了为什么
+    贴 10 笔和贴 100 笔感觉一样慢：耗时几乎全是与笔数无关的固定 I/O。
+
+    返回 (sheet_type, 改名列表, 合并结果, 月份状态)，
+    其中月份状态为 (sheet_type, options, written, totals)。
+    """
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"找不到 Excel 文件：{xlsx_path}")
+
+    wb = load_workbook(xlsx_path, data_only=False)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
+        ws = wb[sheet_name]
+
+        # 安全检查：绝不盲信 UI 缓存的类型，写之前重新判定一次。
+        fresh_type = classify_sheet_type(ws)
+        if expected_sheet_type in ("credit", "debit") and expected_sheet_type != fresh_type:
+            raise ValueError(
+                f"Excel Sheet“{sheet_name}”的识别结果发生变化"
+                f"(界面记录为 {expected_sheet_type}，重新检测为 {fresh_type})。\n"
+                "请重新在下拉框中选择该 Sheet 后再点击 Start，避免写错位置。"
+            )
+        detected_type = fresh_type
+        cache_sheet_type(xlsx_path, sheet_name, detected_type)
+
+        debit_layout = None
+        if detected_type == "debit":
+            debit_layout = get_cached_debit_layout(xlsx_path, sheet_name)
+            if debit_layout is None:
+                debit_layout = find_debit_layout(ws)
+                if debit_layout is None:
+                    raise ValueError(f"Excel Sheet“{sheet_name}”没有可用的 Debit 固定列映射。")
+                cache_debit_layout(xlsx_path, sheet_name, debit_layout)
+
+        real_position = resolve_period_position(
+            ws, detected_type, selected_period_label, selected_period_position,
+            xlsx_path=xlsx_path, sheet_name=sheet_name
+        )
+
+        renamed, merge_result = [], None
+        if detected_type == "credit":
+            update_credit_sheet_in_place(ws, rows, real_position, bank_name)
+        else:
+            update_debit_sheet_in_place(ws, rows, real_position, layout=debit_layout)
+            # 新增 Debit Merchant 可能把 Total 行下移，重建 Credit Summary 的
+            # DEBIT 引用，使 Jan-Dec 始终指向当前的月度 Total 单元格。
+            sync_credit_debit_from_debit_sheet(wb)
+
+            if clean_merchants:
+                renamed, merge_result = clean_debit_merchant_names_on_worksheet(
+                    wb, ws, sheet_name
+                )
+
+        # 布局可能因为插入行/合并行而变化，统计进度前先清掉缓存。
+        if renamed or merge_result:
+            clear_debit_layout_cache(xlsx_path)
+
+        status = collect_period_status_on_worksheet(xlsx_path, ws, sheet_name)
+
+        wb.save(xlsx_path)
+        return detected_type, renamed, merge_result, status
+    finally:
+        wb.close()
 
 
 def append_rows_to_selected_sheet(
@@ -4609,41 +4924,53 @@ def clean_merchant_display_name(name: str, alias_rules: Optional[List[Tuple[str,
         return working
 
     cleaned_tokens = []
-    for token in working.split(" "):
-        original_token = token
+    for raw_token in working.split(" "):
+        original_token = raw_token
 
-        # 整词就是流水号或纯分隔符的，直接丢弃。
-        if _is_pure_number_token(token) or MERCHANT_SEPARATOR_TOKEN_RE.match(token):
-            continue
-
-        # 星号后面是交易码，从星号处截断（Amazon.Com*Nx6 -> Amazon.Com）。
-        star = token.find("*")
+        # 先把整词拆成"最终的词"，再对每个词跑完整规则集。
+        #
+        # 顺序很关键。早期实现是先做整词级判断（纯流水号、参考码、星号截断），
+        # 最后才把连续标点压成空格 —— 于是压缩后新裂出来的词从没经过那些整词
+        # 规则，要等到下一次清洗才被处理，同一个名字清洗两次结果就不一样。
+        # 整列清洗每次写入都会跑，名字不稳定会导致同一个商户反复改名、反复
+        # 参与合并，所以这里必须做到幂等。
+        star = raw_token.find("*")
         if star != -1:
-            token = token[:star]
+            raw_token = raw_token[:star]
+        raw_token = re.sub(r"[\\/*#|]{2,}", " ", raw_token)
 
-        if _is_reference_code_token(token):
-            continue
+        for piece in raw_token.split():
+            # 顺序：先剥掉首尾标点，再做整词判定。
+            #
+            # 反过来会不幂等：像 "\XIP7b4V" 这种带标点的词，isalnum() 是 False，
+            # 逃过了参考码判定；等标点被剥掉变成 "XIP7b4V" 之后，下一轮清洗才
+            # 认出它是参考码并丢掉 —— 同一个名字清洗两次结果不同。
+            piece = piece.strip(" \t-–—/\\*#|,;:.")
+            if not piece or MERCHANT_SEPARATOR_TOKEN_RE.match(piece):
+                continue
 
-        token = MERCHANT_LONG_DIGITS_RE.sub("", token)
-        token = MERCHANT_DOMAIN_SUFFIX_RE.sub("", token)
-        token = MERCHANT_DATE_FRAGMENT_RE.sub("", token)
+            # 整词就是流水号或随机参考码的，直接丢弃。
+            if _is_pure_number_token(piece) or _is_reference_code_token(piece):
+                continue
 
-        # 上面几步会留下连续的标点，例如 Expida// ，压平后再去掉首尾标点。
-        token = re.sub(r"[\\/*#|]{2,}", " ", token)
-        token = token.strip(" \t-–—/\\*#|,;:.")
+            piece = MERCHANT_LONG_DIGITS_RE.sub("", piece)
+            piece = MERCHANT_DOMAIN_SUFFIX_RE.sub("", piece)
+            piece = MERCHANT_DATE_FRAGMENT_RE.sub("", piece)
+            # 上面几步又可能在两端留下标点，再剥一次。
+            piece = piece.strip(" \t-–—/\\*#|,;:.")
 
-        if not token or MERCHANT_SEPARATOR_TOKEN_RE.match(token):
-            continue
+            if not piece or MERCHANT_SEPARATOR_TOKEN_RE.match(piece):
+                continue
 
-        # 删掉流水号后只剩一个字母的，多半是编号的前缀而不是名字的一部分，
-        # 例如门店号 "T-2109" 会剩下一个孤零零的 "T"。这种残渣一并丢掉，
-        # 得到干净的 "Target" 而不是 "Target T"。
-        # 判断条件里要求原词确实含有被删掉的长数字，这样单独成词的 "A"、
-        # "&" 之类不会受影响。
-        if len(token) == 1 and MERCHANT_LONG_DIGITS_RE.search(original_token):
-            continue
+            # 删掉流水号后只剩一个字母的，多半是编号的前缀而不是名字的一部分，
+            # 例如门店号 "T-2109" 会剩下一个孤零零的 "T"。这种残渣一并丢掉，
+            # 得到干净的 "Target" 而不是 "Target T"。
+            # 判断条件里要求原词确实含有被删掉的长数字，这样单独成词的 "A"、
+            # "&" 之类不会受影响。
+            if len(piece) == 1 and MERCHANT_LONG_DIGITS_RE.search(original_token):
+                continue
 
-        cleaned_tokens.append(token)
+            cleaned_tokens.append(piece)
 
     result = " ".join(" ".join(cleaned_tokens).split())
     if not result:
@@ -4656,90 +4983,91 @@ def clean_merchant_display_name(name: str, alias_rules: Optional[List[Tuple[str,
     return result
 
 
-def clean_debit_merchant_names_in_sheet(xlsx_path: Path, sheet_name: str):
-    """把指定 Debit 工作表 Column A 的商户名整体清洗一遍。
+def clean_debit_merchant_names_on_worksheet(wb, ws, sheet_name: str):
+    """在【已经打开的】工作表上清洗 Column A 的商户名，不做任何文件读写。
 
     只处理表头行与 Total 行之间的商户行；Total 行本身、以及它下面的
     BEGIN / ADD / LESS / END 汇总行都不会被碰到。Credit 页面同样不处理。
 
     清洗后若出现同名行（例如多行 Amazon.Com*XXX 被统一成同一个名字），
-    会直接复用既有的合并功能把它们并成一行 —— 这样金额累加、Category
+    直接调用同样"不碰文件"的合并函数把它们并成一行 —— 金额累加、Category
     后面的额外月份列、Total 公式、以及 ADD/END 汇总块的引用修复全都沿用
     同一套已验证过的逻辑，不另写一遍。
 
     返回 (改名列表, 合并结果)；改名列表元素为 (原名, 新名)。
     """
+    # 类型判断沿用全局唯一的那条规则，Credit 页面直接跳过。
+    if classify_sheet_type(ws) != "debit":
+        return [], None
+
+    layout = find_debit_layout(ws)
+    if layout is None:
+        return [], None
+    header_row, merchant_col, _, _, _ = layout
+
+    # 别名表只读一次，整列共用。
+    alias_rules = load_merchant_alias_rules()
+
+    renamed = []
+    cleaned_names = []
+    for row in range(header_row + 1, ws.max_row + 1):
+        raw_name = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
+        if not raw_name:
+            continue
+        if raw_name.upper() in {"TOTAL", "GRAND TOTAL"}:
+            break
+
+        new_name = clean_merchant_display_name(raw_name, alias_rules)
+        if new_name and new_name != raw_name:
+            ws.cell(row=row, column=merchant_col, value=new_name)
+            renamed.append((raw_name, new_name))
+        cleaned_names.append((new_name or raw_name).casefold())
+
+    if not renamed:
+        return [], None
+
+    merge_result = None
+    if len(cleaned_names) != len(set(cleaned_names)):
+        merge_result = merge_duplicate_merchants_on_worksheet(wb, ws, sheet_name)
+    return renamed, merge_result
+
+
+def clean_debit_merchant_names_in_sheet(xlsx_path: Path, sheet_name: str):
+    """文件外壳：打开工作簿 -> 清洗商户名（必要时合并）-> 保存。"""
     xlsx_path = Path(xlsx_path)
     if not xlsx_path.exists() or not sheet_name:
         return [], None
 
-    renamed = []
     wb = load_workbook(xlsx_path, data_only=False)
     try:
         if sheet_name not in wb.sheetnames:
             return [], None
-        ws = wb[sheet_name]
-
-        # 类型判断沿用全局唯一的那条规则，Credit 页面直接跳过。
-        if classify_sheet_type(ws) != "debit":
-            return [], None
-
-        layout = find_debit_layout(ws)
-        if layout is None:
-            return [], None
-        header_row, merchant_col, _, _, _ = layout
-
-        # 别名表只读一次，整列共用。
-        alias_rules = load_merchant_alias_rules()
-
-        cleaned_names = []
-        for row in range(header_row + 1, ws.max_row + 1):
-            raw_name = normalized_cell_text(ws.cell(row=row, column=merchant_col).value)
-            if not raw_name:
-                continue
-            if raw_name.upper() in {"TOTAL", "GRAND TOTAL"}:
-                break
-
-            new_name = clean_merchant_display_name(raw_name, alias_rules)
-            if new_name and new_name != raw_name:
-                ws.cell(row=row, column=merchant_col, value=new_name)
-                renamed.append((raw_name, new_name))
-            cleaned_names.append((new_name or raw_name).casefold())
-
-        if not renamed:
-            return [], None
-
-        wb.save(xlsx_path)
+        renamed, merge_result = clean_debit_merchant_names_on_worksheet(
+            wb, wb[sheet_name], sheet_name
+        )
+        if renamed:
+            wb.save(xlsx_path)
     finally:
         wb.close()
 
-    # 清洗之后可能出现重名行，交给既有的合并功能处理。
-    merge_result = None
-    if len(cleaned_names) != len(set(cleaned_names)):
-        merge_result = merge_duplicate_merchants_in_selected_sheet(xlsx_path, sheet_name)
-
-    clear_debit_layout_cache(xlsx_path)
+    if renamed:
+        clear_debit_layout_cache(xlsx_path)
     return renamed, merge_result
 
 
-def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str):
-    """在指定工作表中原地合并重复 Merchant。
+def merge_duplicate_merchants_on_worksheet(wb, ws, sheet_name: str):
+    """在【已经打开的】工作表上原地合并重复 Merchant，不做任何文件读写。
+
+    把纯表格操作和文件读写分开，是为了让一次 Start 只开关一次工作簿。
+    大报表（多账户页、每页几百商户）读一次要半秒、写一次要 0.4 秒，
+    原来"写入 / 清洗商户名 / 合并去重 / 读进度"各开一次文件，光 I/O 就
+    占掉绝大部分时间 —— 这也是为什么贴 10 笔和贴 100 笔耗时几乎一样。
 
     先完整读取并汇总所有重复行的数据，再删除重复行。这样即使月份/日期列位于
     Total 或 Category 后面（例如 6-Aug），其中的数据也不会因为先删行而丢失。
     其他工作表不会被修改。
     """
-    if not xlsx_path.exists():
-        raise FileNotFoundError(f"找不到 Excel 文件：{xlsx_path}")
-    if not sheet_name:
-        raise ValueError("请先在 UI 中选择Excel Sheet。")
-
-    wb = load_workbook(xlsx_path, data_only=False)
-    try:
-        if sheet_name not in wb.sheetnames:
-            raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
-
-        ws = wb[sheet_name]
+    if True:
         layout = find_debit_layout(ws)
         if layout is None:
             raise ValueError("当前Excel Sheet中找不到可识别的 Debit 月份表格。")
@@ -4874,12 +5202,32 @@ def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str
                 ws, summary_row, merge_offset, min_row=new_summary_row + 1
             )
 
-        wb.save(xlsx_path)
         return {
             "merged_groups": merged_groups,
             "removed_rows": len(duplicate_rows),
             "period_columns": len(period_cols),
         }
+
+
+def merge_duplicate_merchants_in_selected_sheet(xlsx_path: Path, sheet_name: str):
+    """文件外壳：打开工作簿 -> 合并重复 Merchant -> 保存。
+
+    供"合并当前 Sheet"按钮单独使用；写入流程走的是上面的 on_worksheet
+    版本，与其他步骤共用同一次开关文件。
+    """
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"找不到 Excel 文件：{xlsx_path}")
+    if not sheet_name:
+        raise ValueError("请先在 UI 中选择Excel Sheet。")
+
+    wb = load_workbook(xlsx_path, data_only=False)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Excel 中找不到Excel Sheet：{sheet_name}")
+        result = merge_duplicate_merchants_on_worksheet(wb, wb[sheet_name], sheet_name)
+        wb.save(xlsx_path)
+        return result
     finally:
         wb.close()
 
@@ -4892,6 +5240,55 @@ from tkinter import filedialog, messagebox, ttk
 BG = "#1e1e1e"
 FG = "#ffffff"
 BTN = "#2d2d2d"
+
+
+def size_and_center_window(win, preferred_width: int, preferred_height: int,
+                           min_width: int = 0, min_height: int = 0,
+                           screen_ratio: float = 0.9):
+    """按当前屏幕尺寸决定窗口大小，并居中显示。
+
+    程序会在不同分辨率的电脑上运行，写死的 geometry 在小屏笔记本上会超出
+    屏幕（比如 900 高的窗口放不进 768 高的屏），下半部分连按钮都看不见。
+    这里改成"取期望值和屏幕的 90% 中较小的那个"，大屏用期望尺寸，小屏自动
+    缩到装得下为止。
+
+    最小尺寸同样要跟着屏幕收：min_height 如果比屏幕还高，用户就再也没法把
+    窗口调小了，反而卡死。
+
+    返回实际使用的 (宽, 高, x, y)，方便测试核对。
+    """
+    try:
+        win.update_idletasks()
+        screen_w = int(win.winfo_screenwidth())
+        screen_h = int(win.winfo_screenheight())
+    except Exception:
+        screen_w = screen_h = 0
+
+    if screen_w <= 0 or screen_h <= 0:
+        # 拿不到屏幕尺寸（极少见）就退回期望值，至少不会崩。
+        try:
+            win.geometry(f"{preferred_width}x{preferred_height}")
+        except Exception:
+            pass
+        return preferred_width, preferred_height, 0, 0
+
+    width = max(320, min(int(preferred_width), int(screen_w * screen_ratio)))
+    height = max(240, min(int(preferred_height), int(screen_h * screen_ratio)))
+
+    if min_width or min_height:
+        try:
+            win.minsize(min(min_width, width), min(min_height, height))
+        except Exception:
+            pass
+
+    # 居中；如果窗口比屏幕还大（理论上不会），坐标夹到 0，避免跑到屏幕外。
+    x = max(0, (screen_w - width) // 2)
+    y = max(0, (screen_h - height) // 2)
+    try:
+        win.geometry(f"{width}x{height}+{x}+{y}")
+    except Exception:
+        pass
+    return width, height, x, y
 
 
 def mk_label(parent, text="", **kw):
@@ -4919,9 +5316,10 @@ def mk_button(parent, text, cmd):
 def run_parser_ui():
     root = tk.Tk()
     root.title("BSDP - Bank Statement Data Processing")
-    root.geometry("1280x900")
-    root.minsize(1080, 760)
     root.configure(bg=BG)
+    # 大屏用 1280x900，小屏（如 1366x768 的笔记本）自动缩到屏幕的 90%，
+    # 避免窗口比屏幕还高导致下半部分被裁掉。
+    size_and_center_window(root, 1280, 900, min_width=900, min_height=600)
 
     mk_label(
         root,
@@ -5244,6 +5642,13 @@ def run_parser_ui():
 
     render_status()
     refresh_progress()
+
+    # 分类规则在运行期间不会变，启动时先读一次缓存起来，
+    # 后续每次写入都直接用内存里的结果。
+    try:
+        load_category_rules()
+    except Exception:
+        pass
     refresh_progress()
 
     def import_existing_report(clear_existing_data: bool):
@@ -5321,6 +5726,39 @@ def run_parser_ui():
             log_status(f"模板导入失败：{type(e).__name__}: {e}")
             messagebox.showerror("导入失败", f"{type(e).__name__}: {e}")
 
+    def resolve_write_target():
+        """校验界面上选中的写入目标。
+
+        Start 按钮和 Check Image 输入窗口共用这一段：都要往"当前 Sheet 的
+        当前 Month"写数据，校验规则必须完全一致，否则两条入口会出现一个
+        拦得住、另一个拦不住的情况。
+
+        返回 (sheet, month_label, position, sheet_type)；不合法时弹错并返回 None。
+        """
+        index = month_box.current()
+        if index < 0 or index >= len(months) or index >= len(period_positions):
+            messagebox.showerror("错误", "请选择有效日期/月份")
+            log_status("未开始：没有选择有效的日期/月份")
+            return None
+
+        sheet = sheet_var.get().strip()
+        if not sheet:
+            messagebox.showerror("错误", "请选择要修改的Excel Sheet/Page")
+            log_status("未开始：没有选择 Excel Sheet")
+            return None
+
+        sheet_type = current_sheet_type[0]
+        if sheet_type not in ("credit", "debit"):
+            messagebox.showerror(
+                "错误",
+                "当前 Excel Sheet 无法自动识别为 Credit 或 Debit。\n"
+                "请选择包含可识别月份/日期结构的 Sheet。"
+            )
+            log_status(f"未开始：Sheet「{sheet}」无法识别为 Credit 或 Debit")
+            return None
+
+        return sheet, months[index], period_positions[index], sheet_type
+
     def start():
         try:
             content = txt_input.get("1.0", "end-1c")
@@ -5328,33 +5766,11 @@ def run_parser_ui():
             resolved_date_format = resolve_date_input_to_format(custom_date_input)
             configure_date_format(resolved_date_format)
 
-            selected_month_display = month_var.get().strip()
-            selected_month_index = month_box.current()
-            if (
-                    selected_month_index < 0
-                    or selected_month_index >= len(months)
-                    or selected_month_index >= len(period_positions)
-            ):
-                messagebox.showerror("错误", "请选择有效日期/月份")
-                log_status("未开始：没有选择有效的日期/月份")
+            target = resolve_write_target()
+            if target is None:
                 return
-            selected_period_position = period_positions[selected_month_index]
-
-            selected_sheet = sheet_var.get().strip()
-            if not selected_sheet:
-                messagebox.showerror("错误", "请选择要修改的Excel Sheet/Page")
-                log_status("未开始：没有选择 Excel Sheet")
-                return
-
-            selected_sheet_type = current_sheet_type[0]
-            if selected_sheet_type not in ("credit", "debit"):
-                messagebox.showerror(
-                    "错误",
-                    "当前 Excel Sheet 无法自动识别为 Credit 或 Debit。\n"
-                    "请选择包含可识别月份/日期结构的 Sheet。"
-                )
-                log_status(f"未开始：Sheet「{selected_sheet}」无法识别为 Credit 或 Debit")
-                return
+            (selected_sheet, selected_month_display,
+             selected_period_position, selected_sheet_type) = target
 
             bank_name = bank_name_var.get().strip() or DEFAULT_BANK_NAME
             remove_items = parse_remove_items(remove_var.get())
@@ -5427,26 +5843,16 @@ def run_parser_ui():
             rows = [(h.merchant, h.amount, h.who) for h in hits]
             summary_xlsx = get_summary_output_path(summary_var.get())
 
-            detected_type = append_rows_to_selected_sheet(
+            # 写入、商户名清洗、重名合并、月份进度统计，全部在同一次
+            # 工作簿会话里完成。分开做的话，每一步都要把整个工作簿读一遍
+            # 再写一遍，大报表下光 I/O 就要好几秒，而且与交易笔数无关。
+            (detected_type, renamed_merchants,
+             clean_merge_result, period_status) = write_statement_and_finalize(
                 summary_xlsx, selected_sheet, rows,
                 selected_month_display, selected_period_position,
                 expected_sheet_type=selected_sheet_type,
                 bank_name=bank_name,
             )
-
-            # 写入成功后，对 Debit 页面的商户名做一次清洗：去掉流水号、
-            # 交易码和域名后缀，并把因此变成同名的行合并起来。
-            #
-            # 放在写入之后而不是写入之前，是因为清洗要覆盖整列 —— 既包括
-            # 这次刚写进去的商户，也包括表里原本就存在的旧商户，让同一个
-            # 商户不会因为一个带流水号、一个不带而长期占着两行。
-            # Credit 页面不做处理（那里的商户是列标题，结构完全不同）。
-            renamed_merchants = []
-            clean_merge_result = None
-            if detected_type == "debit":
-                renamed_merchants, clean_merge_result = clean_debit_merchant_names_in_sheet(
-                    summary_xlsx, selected_sheet
-                )
 
             # 写入成功后自动清空输入框，方便直接粘贴下一批账单。
             #
@@ -5469,9 +5875,10 @@ def run_parser_ui():
 
             # 用户最关心的是"哪个月写完了"，所以单独用一行突出显示，
             # 不再和处理方式、文件名等细节挤在一起。
-            # 先刷新进度（顺带取回该月份写完后的金额合计），再更新"上次写入"，
-            # 这样金额和进度里显示的是同一次读取的结果，不会出现两处对不上。
-            month_total = refresh_progress(selected_sheet, selected_period_position)
+            # 进度和金额都来自刚才那次写入会话的统计结果，不用再开一次文件。
+            _, status_options, status_written, status_totals = period_status
+            apply_progress(selected_sheet, status_options, status_written, status_totals)
+            month_total = status_totals.get(selected_period_position)
             set_last_write(selected_sheet, selected_month_display, len(rows), month_total)
             log_status(
                 f"完成 {detected_type.title()} 写入（{mode_note}）{clean_note}，文本框已清空"
@@ -5593,9 +6000,190 @@ def run_parser_ui():
             log_status(f"生成默认 Excel 失败：{type(e).__name__}: {e}")
             messagebox.showerror("生成失败", f"{type(e).__name__}: {e}")
 
+    # ---------- Check Image 手工输入窗口 ----------
+    #
+    # 支票影像在账单里是图片，金额和收款人只能人工看着敲。这类数据没有
+    # 日期，月份由主界面的下拉框决定，所以不走文本解析那一套，直接把
+    # "商户 金额" 变成交易行喂给同一个写入入口 —— 商户名清洗、重名合并、
+    # 公式修复、进度统计全都沿用已验证过的同一条流程。
+    check_window_holder = {"win": None}
+
+    def open_check_image_window():
+        existing = check_window_holder.get("win")
+        if existing is not None:
+            try:
+                existing.deiconify()
+                existing.lift()
+                return
+            except Exception:
+                check_window_holder["win"] = None
+
+        win = tk.Toplevel(root)
+        check_window_holder["win"] = win
+        win.title("Check Image Input")
+        win.configure(bg=BG)
+        size_and_center_window(win, 760, 640, min_width=520, min_height=420)
+        # 附属于主窗口：点回主窗口时不会被压到后面找不着，关主窗口时一起收掉。
+        try:
+            win.transient(root)
+        except Exception:
+            pass
+
+        mk_label(win, "Check Image 手工录入", font=("Helvetica", 13, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 2)
+        )
+        mk_label(
+            win,
+            "每行一笔，格式：商户 金额（金额写在最后）\n"
+            "例如：  BUBUGAO 600        HUAnchauhjun 700.28\n"
+            "整数不必写成 600.00，程序会自动补足两位小数。",
+            fg="#9cdcfe", justify="left", anchor="w"
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+
+        target_var = tk.StringVar(value="")
+
+        def refresh_target_label():
+            sheet = sheet_var.get().strip() or "(未选择)"
+            month = month_var.get().strip() or "(未选择)"
+            target_var.set(f"将写入 →  Sheet: {sheet}    Month: {month}")
+
+        refresh_target_label()
+        mk_label(win, textvariable=target_var, fg="#b5e8a9").pack(anchor="w", padx=12)
+
+        # 主界面的 Sheet / Month 随时可能被改，而这个窗口是独立开着的。
+        # 只在打开时算一次的话，用户切了月份之后窗口还显示旧的目标，很容易
+        # 误判自己在往哪个月写。这里定时刷新，让提示始终反映真实写入目标。
+        # 窗口关掉后 holder 会被置空，tick 自然停下，不会留下定时器。
+        def tick_target_label():
+            if check_window_holder.get("win") is not win:
+                return
+            try:
+                refresh_target_label()
+                win.after(400, tick_target_label)
+            except Exception:
+                pass
+
+        try:
+            win.after(400, tick_target_label)
+        except Exception:
+            pass
+
+        # 布局顺序很重要：先把底部按钮栏和提示行用 side="bottom" 占住位置，
+        # 最后才让文本框吃掉剩余空间。
+        #
+        # 反过来的话（文本框先 pack 且 expand=True），窗口一旦不够高，文本框
+        # 会把空间抢光，最后 pack 的按钮直接被挤出可视区 —— 这正是"看不见
+        # 下方按钮"的原因，跟窗口大小只是间接相关。现在无论窗口多小，按钮
+        # 始终留在底部。
+        btn_row = tk.Frame(win, bg=BG)
+        btn_row.pack(side="bottom", fill="x", padx=12, pady=(4, 12))
+
+        info_var = tk.StringVar(value="")
+        mk_label(win, textvariable=info_var, fg="#9cdcfe").pack(
+            side="bottom", anchor="w", padx=12
+        )
+
+        text_frame = tk.Frame(win, bg=BG)
+        text_frame.pack(fill="both", expand=True, padx=12, pady=(6, 4))
+        check_text = tk.Text(
+            text_frame, wrap="none", bg="#111", fg=FG,
+            insertbackground=FG, relief="flat", undo=True
+        )
+        check_text.pack(side="left", fill="both", expand=True)
+        sb2 = tk.Scrollbar(text_frame, command=check_text.yview)
+        sb2.pack(side="right", fill="y")
+        check_text.configure(yscrollcommand=sb2.set)
+
+        def write_check_rows():
+            try:
+                refresh_target_label()
+                content = check_text.get("1.0", tk.END)
+                rows, issues = parse_check_image_lines(content)
+
+                if not rows and not issues:
+                    messagebox.showinfo("提示", "还没有输入任何内容。", parent=win)
+                    return
+
+                if issues:
+                    preview = "\n".join(
+                        f"  第 {line_no} 行：{reason} —— {raw[:40]}"
+                        for line_no, raw, reason in issues[:8]
+                    )
+                    more = f"\n  ...另有 {len(issues) - 8} 行" if len(issues) > 8 else ""
+                    if not rows:
+                        messagebox.showerror(
+                            "无法识别", f"没有识别出任何有效数据：\n\n{preview}{more}",
+                            parent=win
+                        )
+                        return
+                    proceed = messagebox.askyesno(
+                        "有内容无法识别",
+                        f"有 {len(issues)} 行无法识别，这些内容不会被写入：\n\n"
+                        f"{preview}{more}\n\n将写入 {len(rows)} 笔，是否继续？",
+                        parent=win
+                    )
+                    if not proceed:
+                        return
+
+                target = resolve_write_target()
+                if target is None:
+                    return
+                sheet, month_label, position, sheet_type = target
+
+                summary_xlsx = get_summary_output_path(summary_var.get())
+                bank_name = bank_name_var.get().strip() or DEFAULT_BANK_NAME
+
+                (detected_type, renamed, merge_result,
+                 period_status) = write_statement_and_finalize(
+                    summary_xlsx, sheet, rows, month_label, position,
+                    expected_sheet_type=sheet_type, bank_name=bank_name,
+                )
+
+                _, opts, written, totals = period_status
+                apply_progress(sheet, opts, written, totals)
+                month_total = totals.get(position)
+                set_last_write(sheet, month_label, len(rows), month_total)
+                log_status(f"Check Image 写入 {len(rows)} 笔 → {sheet} / {month_label}")
+
+                # 写入成功才清空，失败时保留内容，免得手敲的数据白丢。
+                check_text.delete("1.0", tk.END)
+                info_var.set(
+                    f"已写入 {len(rows)} 笔到 {sheet} / {month_label}"
+                    + (f"，合计 {format_amount_for_display(month_total)}"
+                       if month_total is not None else "")
+                )
+                messagebox.showinfo(
+                    "写入完成",
+                    f"Check Image 已写入 {len(rows)} 笔\n"
+                    f"Sheet: {sheet}\nMonth: {month_label}\n"
+                    f"识别类型: {detected_type.title()}",
+                    parent=win
+                )
+            except Exception as exc:
+                messagebox.showerror("异常 / Error", f"{type(exc).__name__}: {exc}", parent=win)
+                log_status(f"Check Image 写入失败：{type(exc).__name__}: {exc}")
+
+        def clear_check_text():
+            check_text.delete("1.0", tk.END)
+            info_var.set("")
+            check_text.focus_set()
+
+        def close_window():
+            check_window_holder["win"] = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close_window)
+
+        mk_button(btn_row, "写入当前 Sheet / Month", write_check_rows).pack(side="left")
+        mk_button(btn_row, "清空", clear_check_text).pack(side="left", padx=(8, 0))
+        mk_button(btn_row, "关闭", close_window).pack(side="right")
+
+        check_text.focus_set()
+
     # ---------- 右上角按钮：按照界面布局放置 Start 和清空文本框 ----------
     mk_button(top_action_buttons, "Start", start).pack(side="left", padx=(0, 10))
-    mk_button(top_action_buttons, "清空文本框", clear_textbox).pack(side="left")
+    mk_button(top_action_buttons, "清空文本框", clear_textbox).pack(side="left", padx=(0, 10))
+    mk_button(top_action_buttons, "Check Image Input", open_check_image_window).pack(side="left")
 
     # ---------- 底部按钮：左侧导入、真正居中的默认表格、右侧合并 ----------
     # 左右按钮组使用 pack；中间按钮使用 place(relx=0.5)，这样它的位置
